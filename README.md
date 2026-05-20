@@ -35,6 +35,22 @@ Additional folders for code, notes, experiments, and datasets can be added as th
 - [ ] Check any onboard display, indicators, and attached sensors
 - [ ] Record any hardware or software issues discovered during testing
 
+## Access Notes
+
+The following workflow successfully brought the JetBot online and opened the basic motion notebook:
+
+1. Connect a fully charged power bank to the JetBot through the micro USB power input and power the bot on.
+2. Plug in a mouse, keyboard, and monitor to interact with the JetBot directly.
+3. Connect both the JetBot and the laptop to a phone hotspot.
+4. `utexas-iot` may require IT help before it can be used reliably. The MAC address may already be registered, or the device may be presenting a randomized MAC address.
+5. Once the JetBot is online, open `10.53.174.144:8888` in a browser.
+6. Log in with the current Jupyter password: `jetbot`.
+7. In the Jupyter interface, click the folder icon near the top left.
+8. Open the notebook file `basic_motion.ipynb`.
+
+Result:
+`basic_motion.ipynb` ran successfully, the notebook was self-explanatory, and basic motion control worked.
+
 ## Research Direction
 
 Near term work is centered on dependable low-level control and hardware validation. Once the platform is stable, this repository can expand to include:
@@ -48,4 +64,3 @@ Near term work is centered on dependable low-level control and hardware validati
 
 - SparkFun product page: <https://www.sparkfun.com/sparkfun-jetbot-ai-kit-v2-1-powered-by-jetson-nano.html>
 - SparkFun documentation hub: <https://docs.sparkfun.com/>
-
