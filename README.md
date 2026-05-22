@@ -22,6 +22,7 @@ The robot hardware is already assembled. The initial phase of this project is fo
 
 ## Project Structure
 
+- `notebooks/` - Jupyter notebooks used for bring-up tests and hardware experiments
 - `images/` - Photos, diagrams, screenshots, and other project visuals
 
 Additional folders for code, notes, experiments, and datasets can be added as the project grows.
@@ -50,6 +51,17 @@ The following workflow successfully brought the JetBot online and opened the bas
 
 Result:
 `basic_motion.ipynb` ran successfully, the notebook was self-explanatory, and basic motion control worked.
+
+## Session Log
+
+### 2026-05-22
+
+- Confirmed the onboard OLED status display appears to be part of the default JetBot software setup rather than code stored in this repository.
+- Added `notebooks/basic_motion.ipynb` to this repository as the notebook used during bring-up testing.
+- Created `notebooks/oled_hello_nathan.ipynb` as a simple OLED example that writes `Hello Nathan` to the screen.
+- Tested the OLED notebook on the JetBot hardware and confirmed it worked.
+- Documented that the default OLED status display can be restored by restarting `jetbot_stats.service`.
+- Added a new session image: `images/20260522_164809.jpg`.
 
 ## Research Direction
 
