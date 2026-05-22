@@ -62,6 +62,10 @@ Result:
 - Tested the OLED notebook on the JetBot hardware and confirmed it worked.
 - Documented that the default OLED status display can be restored by restarting `jetbot_stats.service`.
 - Added a new session image: `images/20260522_164809.jpg`.
+- Created `notebooks/camera_check.ipynb` to validate the onboard camera from Jupyter.
+- Updated the camera notebook to use the stock `jetbot.Camera` import path after `jetcam` was not available on the device.
+- Tested the camera notebook on the JetBot hardware and confirmed the onboard camera feed worked.
+- Added a new camera test image: `images/2026-05-22 170202.png`.
 
 ## Research Direction
 
