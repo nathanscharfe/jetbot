@@ -22,7 +22,9 @@ The robot hardware is already assembled. The initial phase of this project is fo
 
 ## Project Structure
 
+- `scripts/` - Laptop-side Python tools for Vicon streaming, visualization, and teleoperation
 - `notebooks/` - Jupyter notebooks used for bring-up tests and hardware experiments
+- `chassis redesign/` - CAD files, exports, and reference parts for chassis modification work
 - `images/` - Photos, diagrams, screenshots, and other project visuals
 
 Additional folders for code, notes, experiments, and datasets can be added as the project grows.
@@ -53,6 +55,15 @@ Result:
 `basic_motion.ipynb` ran successfully, the notebook was self-explanatory, and basic motion control worked.
 
 ## Session Log
+
+### 2026-06-10
+
+- Connected the JetBot to the same LAN as the laptop and Vicon system using Ethernet.
+- Found the JetBot on the network at `192.168.0.86`.
+- Verified the JetBot web interface was reachable again over the shared local network.
+- Confirmed the combined Vicon viewer and teleoperation script worked with the clickable control buttons.
+- Added `chassis redesign/` to the repository for chassis CAD and export files.
+- Added a `.gitignore` entry to ignore generated Python cache folders such as `__pycache__/`.
 
 ### 2026-05-22
 
