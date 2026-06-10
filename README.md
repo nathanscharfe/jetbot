@@ -65,6 +65,17 @@ Result:
 - Added `chassis redesign/` to the repository for chassis CAD and export files.
 - Added a `.gitignore` entry to ignore generated Python cache folders such as `__pycache__/`.
 
+## Current Teleop Command
+
+To run the combined Vicon viewer and clickable teleoperation controls from the laptop:
+
+```bash
+python scripts/vicon_teleop_viewer.py --jetbot-host 192.168.0.86 --source-ip 192.168.0.62 --object-name jetbot
+```
+
+Prerequisite:
+Run `notebooks/jetbot_socket_server.ipynb` on the JetBot first so it can accept teleoperation commands from the laptop.
+
 ### 2026-05-22
 
 - Confirmed the onboard OLED status display appears to be part of the default JetBot software setup rather than code stored in this repository.
