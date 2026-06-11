@@ -56,6 +56,15 @@ Result:
 
 ## Session Log
 
+### 2026-06-11
+
+- Extended the Vicon visualization scripts to draw the room volume, robot footprint, and a horizontal heading arrow.
+- Documented that the JetBot's physical forward direction matches the Vicon body-Y / green axis.
+- Created `scripts/vicon_goto_viewer.py` for laptop-side target entry, Vicon visualization, and simple autonomous go-to control.
+- Updated the go-to controller to use short differential-drive steps with pose-settle pauses instead of separate turn and drive phases.
+- Added on-screen manual override buttons plus live controls for `epsilon`, heading offset, step time, and wait time.
+- Set the default pose-settle wait in the go-to viewer to `1.0` second.
+
 ### 2026-06-10
 
 - Connected the JetBot to the same LAN as the laptop and Vicon system using Ethernet.
@@ -75,6 +84,33 @@ python scripts/vicon_teleop_viewer.py --jetbot-host 192.168.0.86 --source-ip 192
 
 Prerequisite:
 Run `notebooks/jetbot_socket_server.ipynb` on the JetBot first so it can accept teleoperation commands from the laptop.
+
+Current default teleoperation tuning in `scripts/vicon_teleop_viewer.py`:
+- `speed = 0.7`
+- `turn_speed = 0.5`
+
+## Current Go-To Command
+
+To run the Vicon room viewer with a simple go-to-target controller from the laptop:
+
+```bash
+python scripts/vicon_goto_viewer.py --jetbot-host 192.168.0.86 --source-ip 192.168.0.62 --object-name jetbot
+```
+
+Prerequisite:
+Run `notebooks/jetbot_socket_server.ipynb` on the JetBot first so it can accept drive commands from the laptop.
+
+Usage:
+- Enter target `X` and `Y` coordinates in the GUI.
+- Click `Go` to send the robot toward the target.
+- The controller sends one short differential-drive step at a time, blending forward motion and steering, then stops, waits, checks the Vicon pose again, and repeats until it reaches the goal.
+- Click `Stop Go-To` to cancel the current target.
+- Press and hold the on-screen `Left`, `Forward`, `Stop`, `Right`, and `Reverse` buttons for manual override. Releasing a motion button stops the robot.
+- Use `Epsilon` to control how close the robot must get before the target counts as reached.
+- Use `Fwd Offset (deg)` to correct any fixed error in the heading direction that is treated as forward.
+- Use `Step Time (s)` to control how long each differential-drive step lasts before stopping.
+- Use `Wait Time (s)` to control how long the script waits after each step before checking the pose again. The current default is `1.0` second.
+- The room view also shows the tracked room bounds, robot footprint, and a horizontal heading arrow based on the JetBot's Vicon green-axis forward direction.
 
 ### 2026-05-22
 

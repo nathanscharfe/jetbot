@@ -27,6 +27,7 @@ streamed for the robot.
 from __future__ import annotations
 
 import argparse
+import math
 import socket
 import struct
 import threading
@@ -37,6 +38,8 @@ from typing import Deque
 
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from matplotlib.lines import Line2D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 
 OBJECT_ITEM_ID = 0
@@ -270,6 +273,288 @@ def set_axes_equal(ax, points: list[tuple[float, float, float]], padding: float)
     ax.set_zlim(z_center - half_span, z_center + half_span)
 
 
+def rotation_matrix_xyz(rx: float, ry: float, rz: float) -> list[list[float]]:
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+
+    rx_matrix = [
+        [1.0, 0.0, 0.0],
+        [0.0, cx, -sx],
+        [0.0, sx, cx],
+    ]
+    ry_matrix = [
+        [cy, 0.0, sy],
+        [0.0, 1.0, 0.0],
+        [-sy, 0.0, cy],
+    ]
+    rz_matrix = [
+        [cz, -sz, 0.0],
+        [sz, cz, 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+
+    def matmul(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
+        return [
+            [
+                sum(a[row][k] * b[k][col] for k in range(3))
+                for col in range(3)
+            ]
+            for row in range(3)
+        ]
+
+    return matmul(rz_matrix, matmul(ry_matrix, rx_matrix))
+
+
+def rotate_vector(
+    rotation: list[list[float]],
+    vector: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return (
+        rotation[0][0] * vector[0] + rotation[0][1] * vector[1] + rotation[0][2] * vector[2],
+        rotation[1][0] * vector[0] + rotation[1][1] * vector[1] + rotation[1][2] * vector[2],
+        rotation[2][0] * vector[0] + rotation[2][1] * vector[1] + rotation[2][2] * vector[2],
+    )
+
+
+def add_vector(
+    a: tuple[float, float, float],
+    b: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def normalize_xy(vector: tuple[float, float, float]) -> tuple[float, float, float]:
+    magnitude = math.hypot(vector[0], vector[1])
+    if magnitude <= 1e-9:
+        return (1.0, 0.0, 0.0)
+    return (vector[0] / magnitude, vector[1] / magnitude, 0.0)
+
+
+def room_corners(
+    room_center: tuple[float, float, float],
+    room_size: tuple[float, float, float],
+) -> dict[str, tuple[float, float, float]]:
+    cx, cy, cz = room_center
+    sx, sy, sz = room_size
+    hx, hy, hz = sx / 2.0, sy / 2.0, sz / 2.0
+    return {
+        "lbf": (cx - hx, cy - hy, cz - hz),
+        "lbb": (cx - hx, cy + hy, cz - hz),
+        "rbf": (cx + hx, cy - hy, cz - hz),
+        "rbb": (cx + hx, cy + hy, cz - hz),
+        "ltf": (cx - hx, cy - hy, cz + hz),
+        "ltb": (cx - hx, cy + hy, cz + hz),
+        "rtf": (cx + hx, cy - hy, cz + hz),
+        "rtb": (cx + hx, cy + hy, cz + hz),
+    }
+
+
+def draw_room(
+    ax,
+    room_center: tuple[float, float, float],
+    room_size: tuple[float, float, float],
+    units: str,
+) -> list[tuple[float, float, float]]:
+    corners = room_corners(room_center, room_size)
+    floor = [corners["lbf"], corners["rbf"], corners["rbb"], corners["lbb"]]
+    ceiling = [corners["ltf"], corners["rtf"], corners["rtb"], corners["ltb"]]
+    wall_loops = [
+        [corners["lbf"], corners["rbf"], corners["rtf"], corners["ltf"]],
+        [corners["rbf"], corners["rbb"], corners["rtb"], corners["rtf"]],
+        [corners["rbb"], corners["lbb"], corners["ltb"], corners["rtb"]],
+        [corners["lbb"], corners["lbf"], corners["ltf"], corners["ltb"]],
+    ]
+
+    floor_patch = Poly3DCollection([floor], alpha=0.08, facecolor="#7fb3d5", edgecolor="none")
+    ceiling_patch = Poly3DCollection([ceiling], alpha=0.02, facecolor="#d5dbdb", edgecolor="none")
+    ax.add_collection3d(floor_patch)
+    ax.add_collection3d(ceiling_patch)
+
+    edge_segments = [
+        ("lbf", "rbf"),
+        ("rbf", "rbb"),
+        ("rbb", "lbb"),
+        ("lbb", "lbf"),
+        ("ltf", "rtf"),
+        ("rtf", "rtb"),
+        ("rtb", "ltb"),
+        ("ltb", "ltf"),
+        ("lbf", "ltf"),
+        ("rbf", "rtf"),
+        ("rbb", "rtb"),
+        ("lbb", "ltb"),
+    ]
+    for start_key, end_key in edge_segments:
+        start = corners[start_key]
+        end = corners[end_key]
+        ax.plot(
+            [start[0], end[0]],
+            [start[1], end[1]],
+            [start[2], end[2]],
+            color="#7f8c8d",
+            linewidth=1.0,
+            alpha=0.55,
+        )
+
+    for wall in wall_loops:
+        loop = wall + [wall[0]]
+        ax.plot(
+            [point[0] for point in loop],
+            [point[1] for point in loop],
+            [point[2] for point in loop],
+            color="#bdc3c7",
+            linewidth=0.8,
+            alpha=0.25,
+        )
+
+    floor_z = floor[0][2]
+    x_ticks = 4
+    y_ticks = 4
+    x_min, x_max = corners["lbf"][0], corners["rbf"][0]
+    y_min, y_max = corners["lbf"][1], corners["lbb"][1]
+
+    for index in range(1, x_ticks):
+        x = x_min + (x_max - x_min) * index / x_ticks
+        ax.plot(
+            [x, x],
+            [y_min, y_max],
+            [floor_z, floor_z],
+            color="#d5d8dc",
+            linewidth=0.8,
+            alpha=0.4,
+        )
+    for index in range(1, y_ticks):
+        y = y_min + (y_max - y_min) * index / y_ticks
+        ax.plot(
+            [x_min, x_max],
+            [y, y],
+            [floor_z, floor_z],
+            color="#d5d8dc",
+            linewidth=0.8,
+            alpha=0.4,
+        )
+
+    ax.text(
+        corners["lbf"][0],
+        corners["lbf"][1],
+        corners["ltf"][2],
+        f"Room ({units})",
+        color="#566573",
+        fontsize=9,
+    )
+
+    return list(corners.values())
+
+
+def draw_pose_marker(
+    ax,
+    pose: ViconPose,
+    display_scale: float,
+    color,
+    label: str,
+    body_size: float,
+    axis_length: float,
+) -> list[tuple[float, float, float]]:
+    center = (
+        pose.tx * display_scale,
+        pose.ty * display_scale,
+        pose.tz * display_scale,
+    )
+    rotation = rotation_matrix_xyz(pose.rx, pose.ry, pose.rz)
+
+    half_body = body_size / 2.0
+    local_corners = [
+        (-half_body, -half_body, 0.0),
+        (half_body, -half_body, 0.0),
+        (half_body, half_body, 0.0),
+        (-half_body, half_body, 0.0),
+    ]
+    world_corners = [
+        add_vector(center, rotate_vector(rotation, corner))
+        for corner in local_corners
+    ]
+    loop = world_corners + [world_corners[0]]
+    ax.plot(
+        [point[0] for point in loop],
+        [point[1] for point in loop],
+        [point[2] for point in loop],
+        color=color,
+        linewidth=1.8,
+    )
+
+    forward_tip = add_vector(center, rotate_vector(rotation, (axis_length, 0.0, 0.0)))
+    left_tip = add_vector(center, rotate_vector(rotation, (0.0, axis_length * 0.7, 0.0)))
+    up_tip = add_vector(center, rotate_vector(rotation, (0.0, 0.0, axis_length * 0.7)))
+    # The Vicon rigid-body definition for this JetBot uses body-Y (green) as physical forward.
+    physical_forward_tip = add_vector(center, rotate_vector(rotation, (0.0, axis_length, 0.0)))
+    horizontal_heading = normalize_xy(
+        (
+            physical_forward_tip[0] - center[0],
+            physical_forward_tip[1] - center[1],
+            physical_forward_tip[2] - center[2],
+        )
+    )
+    heading_tip = add_vector(
+        center,
+        (
+            horizontal_heading[0] * axis_length,
+            horizontal_heading[1] * axis_length,
+            0.0,
+        ),
+    )
+
+    ax.quiver(
+        center[0],
+        center[1],
+        center[2],
+        forward_tip[0] - center[0],
+        forward_tip[1] - center[1],
+        forward_tip[2] - center[2],
+        color="#e74c3c",
+        linewidth=2.0,
+        arrow_length_ratio=0.2,
+    )
+    ax.quiver(
+        center[0],
+        center[1],
+        center[2],
+        left_tip[0] - center[0],
+        left_tip[1] - center[1],
+        left_tip[2] - center[2],
+        color="#27ae60",
+        linewidth=1.6,
+        arrow_length_ratio=0.2,
+    )
+    ax.quiver(
+        center[0],
+        center[1],
+        center[2],
+        up_tip[0] - center[0],
+        up_tip[1] - center[1],
+        up_tip[2] - center[2],
+        color="#2980b9",
+        linewidth=1.6,
+        arrow_length_ratio=0.2,
+    )
+    ax.quiver(
+        center[0],
+        center[1],
+        center[2],
+        heading_tip[0] - center[0],
+        heading_tip[1] - center[1],
+        0.0,
+        color="#111111",
+        linewidth=2.8,
+        arrow_length_ratio=0.18,
+        alpha=0.95,
+    )
+    ax.scatter([center[0]], [center[1]], [center[2]], color=[color], s=55, zorder=5)
+    ax.text(center[0], center[1], center[2], f" {label}", color=color)
+
+    return world_corners + [forward_tip, left_tip, up_tip, physical_forward_tip, heading_tip, center]
+
+
 def build_status_lines(
     snapshot: dict,
     selected_name: str | None,
@@ -385,6 +670,34 @@ def make_parser() -> argparse.ArgumentParser:
         help="3D camera azimuth angle for the plot.",
     )
     parser.add_argument(
+        "--room-size",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=(4000.0, 4000.0, 2500.0),
+        help="Displayed room size in Vicon translation units, defaulting to a 4m x 4m x 2.5m room.",
+    )
+    parser.add_argument(
+        "--room-center",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=(0.0, 0.0, 1250.0),
+        help="Displayed room center in Vicon translation units.",
+    )
+    parser.add_argument(
+        "--robot-footprint",
+        type=float,
+        default=250.0,
+        help="Displayed robot body width in Vicon translation units.",
+    )
+    parser.add_argument(
+        "--robot-axis-length",
+        type=float,
+        default=350.0,
+        help="Displayed robot heading axis length in Vicon translation units.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print parse errors for malformed or unexpected packets.",
@@ -397,6 +710,10 @@ def main() -> None:
     selected_object_name = args.object_name or None
 
     display_scale = 1.0 if args.units == "mm" else 0.001
+    room_center = tuple(value * display_scale for value in args.room_center)
+    room_size = tuple(value * display_scale for value in args.room_size)
+    robot_footprint = args.robot_footprint * display_scale
+    robot_axis_length = args.robot_axis_length * display_scale
     shared_state = SharedState(
         history_size=args.history,
         stale_after_seconds=args.stale_after,
@@ -427,11 +744,15 @@ def main() -> None:
         ax.set_title("Vicon UDP 3D Viewer")
         ax.view_init(elev=args.elevation_deg, azim=args.azimuth_deg)
 
-        plotted_points: list[tuple[float, float, float]] = []
+        plotted_points = draw_room(ax, room_center, room_size, args.units)
         names = sorted(visible)
+        legend_handles: list[Line2D] = []
 
         for index, name in enumerate(names):
             color = color_cycle[index % len(color_cycle)]
+            legend_handles.append(
+                Line2D([0], [0], color=color, marker="o", linestyle="-", linewidth=1.5, markersize=6, label=name)
+            )
             pose = visible[name]["pose"]
             history_points = [
                 (x * display_scale, y * display_scale, z * display_scale)
@@ -445,19 +766,24 @@ def main() -> None:
                 ax.plot(hx, hy, hz, color=color, linewidth=1.5, alpha=0.75)
                 plotted_points.extend(history_points)
 
-            x = pose.tx * display_scale
-            y = pose.ty * display_scale
-            z = pose.tz * display_scale
-            ax.scatter([x], [y], [z], color=[color], s=60, label=name)
-            ax.text(x, y, z, f" {name}", color=color)
-            plotted_points.append((x, y, z))
+            plotted_points.extend(
+                draw_pose_marker(
+                    ax,
+                    pose,
+                    display_scale=display_scale,
+                    color=color,
+                    label=name,
+                    body_size=robot_footprint,
+                    axis_length=robot_axis_length,
+                )
+            )
 
         ax.scatter([0.0], [0.0], [0.0], color="black", marker="x", s=40)
 
         set_axes_equal(ax, plotted_points, padding=args.axis_padding * display_scale)
 
-        if names and len(names) <= 10:
-            ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+        if legend_handles and len(legend_handles) <= 10:
+            ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
         status_lines = build_status_lines(
             snapshot,

@@ -33,9 +33,17 @@ from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from matplotlib.lines import Line2D
 from matplotlib.widgets import Button
 
-from vicon_udp_viewer import SharedState, ViconReceiver, build_status_lines, set_axes_equal
+from vicon_udp_viewer import (
+    SharedState,
+    ViconReceiver,
+    build_status_lines,
+    draw_pose_marker,
+    draw_room,
+    set_axes_equal,
+)
 
 
 DEFAULT_VICON_SOURCE_IP = "192.168.0.62"
@@ -217,8 +225,26 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--axis-padding", type=float, default=250.0)
     parser.add_argument("--elevation-deg", type=float, default=25.0)
     parser.add_argument("--azimuth-deg", type=float, default=45.0)
-    parser.add_argument("--speed", type=float, default=0.25, help="Base forward/reverse speed.")
-    parser.add_argument("--turn-speed", type=float, default=0.2, help="Base turning speed.")
+    parser.add_argument(
+        "--room-size",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=(4000.0, 4000.0, 2500.0),
+        help="Displayed room size in Vicon translation units.",
+    )
+    parser.add_argument(
+        "--room-center",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=(0.0, 0.0, 1250.0),
+        help="Displayed room center in Vicon translation units.",
+    )
+    parser.add_argument("--robot-footprint", type=float, default=250.0)
+    parser.add_argument("--robot-axis-length", type=float, default=350.0)
+    parser.add_argument("--speed", type=float, default=0.7, help="Base forward/reverse speed.")
+    parser.add_argument("--turn-speed", type=float, default=0.5, help="Base turning speed.")
     parser.add_argument("--jetbot-host", default=DEFAULT_JETBOT_HOST)
     parser.add_argument("--jetbot-port", type=int, default=DEFAULT_JETBOT_PORT)
     parser.add_argument("--send-rate-hz", type=float, default=15.0)
@@ -230,6 +256,10 @@ def main() -> None:
     args = make_parser().parse_args()
     selected_object_name = args.object_name or None
     display_scale = 1.0 if args.units == "mm" else 0.001
+    room_center = tuple(value * display_scale for value in args.room_center)
+    room_size = tuple(value * display_scale for value in args.room_size)
+    robot_footprint = args.robot_footprint * display_scale
+    robot_axis_length = args.robot_axis_length * display_scale
 
     shared_state = SharedState(
         history_size=args.history,
@@ -319,7 +349,7 @@ def main() -> None:
     teleop_client.start()
 
     fig = plt.figure(figsize=(11, 8))
-    fig.subplots_adjust(bottom=0.22, right=0.8, top=0.92)
+    fig.subplots_adjust(bottom=0.26, right=0.8, top=0.92)
     ax = fig.add_subplot(111, projection="3d")
     fig.canvas.mpl_connect("key_press_event", on_key_press)
     fig.canvas.mpl_connect("key_release_event", on_key_release)
@@ -327,31 +357,31 @@ def main() -> None:
     button_specs = [
         {
             "label": "Forward",
-            "rect": [0.31, 0.11, 0.14, 0.06],
+            "rect": [0.40, 0.15, 0.16, 0.05],
             "command": (args.speed, args.speed),
             "color": "#8fd19e",
         },
         {
             "label": "Left",
-            "rect": [0.16, 0.04, 0.14, 0.06],
+            "rect": [0.22, 0.08, 0.16, 0.05],
             "command": (-args.turn_speed, args.turn_speed),
             "color": "#9ec5fe",
         },
         {
             "label": "Stop",
-            "rect": [0.31, 0.04, 0.14, 0.06],
+            "rect": [0.40, 0.08, 0.16, 0.05],
             "command": None,
             "color": "#f5a3a3",
         },
         {
             "label": "Right",
-            "rect": [0.46, 0.04, 0.14, 0.06],
+            "rect": [0.58, 0.08, 0.16, 0.05],
             "command": (args.turn_speed, -args.turn_speed),
             "color": "#9ec5fe",
         },
         {
             "label": "Reverse",
-            "rect": [0.31, 0.01, 0.14, 0.06],
+            "rect": [0.40, 0.01, 0.16, 0.05],
             "command": (-args.speed, -args.speed),
             "color": "#f7c97f",
         },
@@ -406,11 +436,15 @@ def main() -> None:
         ax.set_title("Vicon Teleop Viewer")
         ax.view_init(elev=args.elevation_deg, azim=args.azimuth_deg)
 
-        plotted_points: list[tuple[float, float, float]] = []
+        plotted_points = draw_room(ax, room_center, room_size, args.units)
         names = sorted(visible)
+        legend_handles: list[Line2D] = []
 
         for index, name in enumerate(names):
             color = color_cycle[index % len(color_cycle)]
+            legend_handles.append(
+                Line2D([0], [0], color=color, marker="o", linestyle="-", linewidth=1.5, markersize=6, label=name)
+            )
             pose = visible[name]["pose"]
             history_points = [
                 (x * display_scale, y * display_scale, z * display_scale)
@@ -424,18 +458,23 @@ def main() -> None:
                 ax.plot(hx, hy, hz, color=color, linewidth=1.5, alpha=0.75)
                 plotted_points.extend(history_points)
 
-            x = pose.tx * display_scale
-            y = pose.ty * display_scale
-            z = pose.tz * display_scale
-            ax.scatter([x], [y], [z], color=[color], s=60, label=name)
-            ax.text(x, y, z, f" {name}", color=color)
-            plotted_points.append((x, y, z))
+            plotted_points.extend(
+                draw_pose_marker(
+                    ax,
+                    pose,
+                    display_scale=display_scale,
+                    color=color,
+                    label=name,
+                    body_size=robot_footprint,
+                    axis_length=robot_axis_length,
+                )
+            )
 
         ax.scatter([0.0], [0.0], [0.0], color="black", marker="x", s=40)
         set_axes_equal(ax, plotted_points, padding=args.axis_padding * display_scale)
 
-        if names and len(names) <= 10:
-            ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+        if legend_handles and len(legend_handles) <= 10:
+            ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
         status_lines = build_status_lines(
             snapshot,
@@ -455,6 +494,7 @@ def main() -> None:
                 f"JetBot server: {teleop_status['host']}:{teleop_status['port']}",
                 f"Teleop link: {'connected' if teleop_status['connected'] else 'disconnected'}",
                 f"Drive command: ({drive_command.left:.2f}, {drive_command.right:.2f})",
+                f"Speed settings: speed={args.speed:.2f}, turn={args.turn_speed:.2f}",
                 "Controls: press and hold buttons below plot, Space to stop",
             ]
         )
