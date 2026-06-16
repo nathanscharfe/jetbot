@@ -455,6 +455,7 @@ def draw_pose_marker(
     label: str,
     body_size: float,
     axis_length: float,
+    heading_correction_deg: float = 0.0,
 ) -> list[tuple[float, float, float]]:
     center = (
         pose.tx * display_scale,
@@ -495,6 +496,15 @@ def draw_pose_marker(
             physical_forward_tip[2] - center[2],
         )
     )
+    if abs(heading_correction_deg) > 1e-9:
+        correction_rad = math.radians(heading_correction_deg)
+        cos_theta = math.cos(correction_rad)
+        sin_theta = math.sin(correction_rad)
+        horizontal_heading = (
+            horizontal_heading[0] * cos_theta - horizontal_heading[1] * sin_theta,
+            horizontal_heading[0] * sin_theta + horizontal_heading[1] * cos_theta,
+            0.0,
+        )
     heading_tip = add_vector(
         center,
         (

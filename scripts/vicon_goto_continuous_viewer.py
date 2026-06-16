@@ -1,16 +1,17 @@
 """
-Vicon room viewer with simple go-to-target control for JetBot.
+Vicon room viewer with continuous go-to-target control for JetBot.
 
 Run this on the laptop while `notebooks/jetbot_socket_server.ipynb` is running on
 the JetBot. The script:
 - receives the Vicon UDP Object Stream
 - shows the room and the robot pose in 3D
 - lets the user enter a target X/Y coordinate and click Go
-- sends short differential-drive steps toward the goal and corrects heading on the way
+- continuously updates the differential-drive wheel commands toward the target
 - stops automatically once the robot gets within an epsilon of the target
 
-This is a simple point-to-point controller intended for bring-up and experiments,
-not a full planner or obstacle avoidance stack.
+This variant is intended for low-latency links where the controller can steer
+continuously instead of pulsing the robot forward and waiting for the pose to
+settle between moves.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ from __future__ import annotations
 import argparse
 import math
 import threading
-import time
 from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
@@ -67,14 +67,12 @@ class TargetState:
 
 
 @dataclass
-class GoToTuning:
+class ContinuousTuning:
     epsilon: float = 150.0
     heading_offset_deg: float = 0.0
-    step_drive_seconds: float = 0.18
-    settle_seconds: float = 1.0
 
 
-class GoToController(threading.Thread):
+class ContinuousGoToController(threading.Thread):
     def __init__(
         self,
         shared_state: SharedState,
@@ -86,12 +84,8 @@ class GoToController(threading.Thread):
         epsilon: float,
         slow_radius: float,
         heading_gain: float,
-        turn_gain: float,
-        turn_in_place_deg: float,
         control_rate_hz: float,
         heading_offset_deg: float,
-        step_drive_seconds: float,
-        settle_seconds: float,
     ) -> None:
         super().__init__(daemon=True)
         self._shared_state = shared_state
@@ -102,21 +96,14 @@ class GoToController(threading.Thread):
         self._min_forward_speed = min_forward_speed
         self._slow_radius = slow_radius
         self._heading_gain = heading_gain
-        self._turn_gain = turn_gain
-        self._turn_in_place_rad = math.radians(turn_in_place_deg)
         self._period = 1.0 / max(control_rate_hz, 1.0)
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._state = TargetState()
-        self._tuning = GoToTuning(
+        self._tuning = ContinuousTuning(
             epsilon=epsilon,
             heading_offset_deg=heading_offset_deg,
-            step_drive_seconds=step_drive_seconds,
-            settle_seconds=settle_seconds,
         )
-        self._phase = "idle"
-        self._phase_deadline = 0.0
-        self._active_step_command = (0.0, 0.0)
 
     def set_target(self, target_x: float, target_y: float) -> None:
         with self._lock:
@@ -128,11 +115,8 @@ class GoToController(threading.Thread):
                 last_distance=None,
                 last_heading_error_deg=None,
                 mode="target_set",
-                message="Target accepted. Turning toward goal.",
+                message="Target accepted. Driving continuously toward goal.",
             )
-            self._phase = "decision"
-            self._phase_deadline = 0.0
-            self._active_step_command = (0.0, 0.0)
 
     def clear_target(self, message: str = "Target cleared.") -> None:
         self._drive_state.stop()
@@ -140,9 +124,6 @@ class GoToController(threading.Thread):
             self._state.active = False
             self._state.mode = "idle"
             self._state.message = message
-            self._phase = "idle"
-            self._phase_deadline = 0.0
-            self._active_step_command = (0.0, 0.0)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -161,13 +142,11 @@ class GoToController(threading.Thread):
                 message=self._state.message,
             )
 
-    def tuning_snapshot(self) -> GoToTuning:
+    def tuning_snapshot(self) -> ContinuousTuning:
         with self._lock:
-            return GoToTuning(
+            return ContinuousTuning(
                 epsilon=self._tuning.epsilon,
                 heading_offset_deg=self._tuning.heading_offset_deg,
-                step_drive_seconds=self._tuning.step_drive_seconds,
-                settle_seconds=self._tuning.settle_seconds,
             )
 
     def set_message(self, message: str) -> None:
@@ -178,24 +157,15 @@ class GoToController(threading.Thread):
         *,
         epsilon: float,
         heading_offset_deg: float,
-        step_drive_seconds: float,
-        settle_seconds: float,
     ) -> tuple[bool, str]:
         if epsilon <= 0.0:
             return False, "Epsilon must be positive."
-        if step_drive_seconds <= 0.0:
-            return False, "Step drive time must be positive."
-        if settle_seconds < 0.0:
-            return False, "Wait time must be zero or positive."
 
         with self._lock:
             self._tuning.epsilon = epsilon
             self._tuning.heading_offset_deg = heading_offset_deg
-            self._tuning.step_drive_seconds = step_drive_seconds
-            self._tuning.settle_seconds = settle_seconds
             self._state.message = (
-                f"Tuning updated: epsilon={epsilon:.1f}, angle correction={heading_offset_deg:.1f} deg, "
-                f"step={step_drive_seconds:.2f}s, wait={settle_seconds:.2f}s"
+                f"Tuning updated: epsilon={epsilon:.1f}, angle correction={heading_offset_deg:.1f} deg"
             )
 
         return True, "Tuning updated."
@@ -232,11 +202,8 @@ class GoToController(threading.Thread):
         while not self._stop_event.is_set():
             active, target_x, target_y = self._current_target()
             tuning = self.tuning_snapshot()
-            now = time.time()
 
             if not active:
-                # Stay out of the way when no go-to target is active so manual
-                # drive commands can use the shared drive state.
                 self._stop_event.wait(self._period)
                 continue
 
@@ -250,7 +217,6 @@ class GoToController(threading.Thread):
                     mode="waiting_for_pose",
                     message="Waiting for a fresh pose for the selected object.",
                 )
-                self._phase = "waiting_for_pose"
                 self._stop_event.wait(self._period)
                 continue
 
@@ -269,44 +235,8 @@ class GoToController(threading.Thread):
             heading_error = wrap_to_pi(target_heading - current_heading)
             heading_error_deg = math.degrees(heading_error)
 
-            if self._phase == "step_move":
-                if now >= self._phase_deadline:
-                    self._drive_state.stop()
-                    self._phase = "settling"
-                    self._phase_deadline = now + tuning.settle_seconds
-                    self._update_state(
-                        last_distance=distance,
-                        last_heading_error_deg=heading_error_deg,
-                        mode="settling",
-                        message="Step complete. Waiting for pose to settle.",
-                    )
-                else:
-                    self._drive_state.set(*self._active_step_command)
-                    self._update_state(
-                        last_distance=distance,
-                        last_heading_error_deg=heading_error_deg,
-                        mode="step_move",
-                        message="Executing one short differential step toward the target.",
-                    )
-                self._stop_event.wait(self._period)
-                continue
-
-            if self._phase == "settling":
-                self._drive_state.stop()
-                if now < self._phase_deadline:
-                    self._update_state(
-                        last_distance=distance,
-                        last_heading_error_deg=heading_error_deg,
-                        mode="settling",
-                        message="Waiting before the next pose correction.",
-                    )
-                    self._stop_event.wait(self._period)
-                    continue
-                self._phase = "decision"
-
             if distance <= tuning.epsilon:
                 self._drive_state.stop()
-                self._phase = "idle"
                 self._update_state(
                     active=False,
                     reached=True,
@@ -325,38 +255,31 @@ class GoToController(threading.Thread):
                 base_forward = self._min_forward_speed + (self._speed - self._min_forward_speed) * blend
                 base_forward = min(base_forward, self._speed)
 
-            # Fade the forward component when the robot is pointed away from
-            # the goal, while steering still differentially bends the motion.
+            # Reduce forward push when the robot points away from the target,
+            # while still letting the wheel-speed difference steer it back.
             heading_alignment = max(0.0, math.cos(heading_error))
             forward = base_forward * (heading_alignment**2)
-
-            steering_limit = self._turn_speed * max(self._turn_gain, 0.1)
             steering = clamp(
                 self._heading_gain * heading_error,
-                -steering_limit,
-                steering_limit,
+                -self._turn_speed,
+                self._turn_speed,
             )
             left = clamp(forward - steering)
             right = clamp(forward + steering)
-            self._active_step_command = (left, right)
-            self._phase = "step_move"
-            self._phase_deadline = now + tuning.step_drive_seconds
-            mode = "step_move"
-            message = "Starting one short differential step."
 
             self._drive_state.set(left, right)
             self._update_state(
                 last_distance=distance,
                 last_heading_error_deg=heading_error_deg,
-                mode=mode,
-                message=message,
+                mode="continuous",
+                message="Driving continuously toward the target.",
             )
             self._stop_event.wait(self._period)
 
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Receive the Vicon UDP stream, show the room in 3D, and drive the JetBot to a target."
+        description="Receive the Vicon UDP stream, show the room in 3D, and continuously drive the JetBot to a target."
     )
     parser.add_argument("--bind-host", default="0.0.0.0")
     parser.add_argument("--source-ip", default=DEFAULT_VICON_SOURCE_IP)
@@ -394,15 +317,11 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epsilon", type=float, default=150.0, help="Target tolerance in Vicon translation units.")
     parser.add_argument("--slow-radius", type=float, default=700.0, help="Start slowing down within this radius.")
     parser.add_argument("--heading-gain", type=float, default=0.9)
-    parser.add_argument("--turn-gain", type=float, default=0.8)
-    parser.add_argument("--turn-in-place-deg", type=float, default=18.0)
     parser.add_argument("--forward-offset-deg", type=float, default=0.0)
-    parser.add_argument("--step-drive-seconds", type=float, default=0.18)
-    parser.add_argument("--settle-seconds", type=float, default=1.0)
-    parser.add_argument("--control-rate-hz", type=float, default=15.0)
+    parser.add_argument("--control-rate-hz", type=float, default=20.0)
     parser.add_argument("--jetbot-host", default=DEFAULT_JETBOT_HOST)
     parser.add_argument("--jetbot-port", type=int, default=DEFAULT_JETBOT_PORT)
-    parser.add_argument("--send-rate-hz", type=float, default=15.0)
+    parser.add_argument("--send-rate-hz", type=float, default=20.0)
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -440,7 +359,7 @@ def main() -> None:
         verbose=args.verbose,
     )
 
-    controller = GoToController(
+    controller = ContinuousGoToController(
         shared_state=shared_state,
         selected_name=selected_object_name or args.object_name,
         drive_state=drive_state,
@@ -450,12 +369,8 @@ def main() -> None:
         epsilon=args.epsilon,
         slow_radius=args.slow_radius,
         heading_gain=args.heading_gain,
-        turn_gain=args.turn_gain,
-        turn_in_place_deg=args.turn_in_place_deg,
         control_rate_hz=args.control_rate_hz,
         heading_offset_deg=args.forward_offset_deg,
-        step_drive_seconds=args.step_drive_seconds,
-        settle_seconds=args.settle_seconds,
     )
 
     receiver.start()
@@ -467,32 +382,26 @@ def main() -> None:
     status_ax = fig.add_axes([0.03, 0.39, 0.20, 0.51])
     status_ax.axis("off")
 
-    fig.text(0.08, 0.315, "Go-To Target", fontsize=11, fontweight="bold")
+    fig.text(0.08, 0.315, "Continuous Go-To Target", fontsize=11, fontweight="bold")
     fig.text(0.08, 0.292, f"Target X ({args.units})", fontsize=9)
     fig.text(0.26, 0.292, f"Target Y ({args.units})", fontsize=9)
     fig.text(0.08, 0.205, "Controller Tuning", fontsize=11, fontweight="bold")
     fig.text(0.08, 0.182, f"Epsilon ({args.units})", fontsize=9)
-    fig.text(0.21, 0.182, "Angle Correction (deg)", fontsize=9)
-    fig.text(0.34, 0.182, "Step Time (s)", fontsize=9)
-    fig.text(0.47, 0.182, "Wait Time (s)", fontsize=9)
+    fig.text(0.24, 0.182, "Angle Correction (deg)", fontsize=9)
     fig.text(0.50, 0.095, "Manual Drive (press and hold)", fontsize=11, fontweight="bold", ha="center")
 
     x_box_ax = fig.add_axes([0.08, 0.235, 0.14, 0.055])
     y_box_ax = fig.add_axes([0.26, 0.235, 0.14, 0.055])
     go_button_ax = fig.add_axes([0.45, 0.235, 0.11, 0.055])
     stop_button_ax = fig.add_axes([0.60, 0.235, 0.16, 0.055])
-    epsilon_box_ax = fig.add_axes([0.08, 0.125, 0.10, 0.055])
-    offset_box_ax = fig.add_axes([0.21, 0.125, 0.10, 0.055])
-    step_box_ax = fig.add_axes([0.34, 0.125, 0.10, 0.055])
-    wait_box_ax = fig.add_axes([0.47, 0.125, 0.10, 0.055])
-    apply_button_ax = fig.add_axes([0.61, 0.125, 0.11, 0.055])
+    epsilon_box_ax = fig.add_axes([0.08, 0.125, 0.12, 0.055])
+    offset_box_ax = fig.add_axes([0.24, 0.125, 0.12, 0.055])
+    apply_button_ax = fig.add_axes([0.40, 0.125, 0.11, 0.055])
 
     x_text = TextBox(x_box_ax, "", initial="0")
     y_text = TextBox(y_box_ax, "", initial="0")
     epsilon_text = TextBox(epsilon_box_ax, "", initial=f"{args.epsilon * display_scale:.1f}")
     offset_text = TextBox(offset_box_ax, "", initial=f"{args.forward_offset_deg:.1f}")
-    step_text = TextBox(step_box_ax, "", initial=f"{args.step_drive_seconds:.2f}")
-    wait_text = TextBox(wait_box_ax, "", initial=f"{args.settle_seconds:.2f}")
     go_button = Button(go_button_ax, "Go", color="#8fd19e", hovercolor="#d5f5e3")
     stop_button = Button(stop_button_ax, "Stop Go-To", color="#f5a3a3", hovercolor="#fadbd8")
     apply_button = Button(apply_button_ax, "Apply", color="#aed6f1", hovercolor="#d6eaf8")
@@ -507,19 +416,13 @@ def main() -> None:
         try:
             epsilon_display = float(epsilon_text.text)
             heading_offset_deg = float(offset_text.text)
-            step_drive_seconds = float(step_text.text)
-            settle_seconds = float(wait_text.text)
         except ValueError:
-            controller.set_message(
-                "Invalid tuning entry. Use numeric values for epsilon, angle correction, step, and wait."
-            )
+            controller.set_message("Invalid tuning entry. Use numeric values for epsilon and angle correction.")
             return False
 
         ok, message = controller.update_tuning(
             epsilon=epsilon_display * input_to_vicon_scale,
             heading_offset_deg=heading_offset_deg,
-            step_drive_seconds=step_drive_seconds,
-            settle_seconds=settle_seconds,
         )
         controller.set_message(message)
         return ok
@@ -628,7 +531,7 @@ def main() -> None:
         ax.set_xlabel(f"X ({args.units})")
         ax.set_ylabel(f"Y ({args.units})")
         ax.set_zlabel(f"Z ({args.units})")
-        ax.set_title("Vicon Go-To Viewer")
+        ax.set_title("Vicon Continuous Go-To Viewer")
         ax.view_init(elev=args.elevation_deg, azim=args.azimuth_deg)
 
         plotted_points = draw_room(ax, room_center, room_size, args.units)
@@ -730,7 +633,10 @@ def main() -> None:
                 f"Target ({args.units}): ({target_x_status:.3f}, {target_y_status:.3f})",
                 f"Epsilon ({args.units}): {tuning_state.epsilon * display_scale:.3f}",
                 f"Angle correction (deg): {tuning_state.heading_offset_deg:.1f}",
-                f"Step / wait (s): {tuning_state.step_drive_seconds:.2f} / {tuning_state.settle_seconds:.2f}",
+                (
+                    f"Speed settings: speed={args.speed:.2f}, turn={args.turn_speed:.2f}, "
+                    f"min={args.min_forward_speed:.2f}"
+                ),
             ]
         )
 
