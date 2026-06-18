@@ -56,6 +56,15 @@ Result:
 
 ## Session Log
 
+### 2026-06-18
+
+- Confirmed the Vicon UDP stream had about `1-2` seconds of latency on the laptop over Wi-Fi, while the same indicator reacted immediately on the Vicon machine and over wired Ethernet.
+- Added `scripts/vicon_motion_indicator.py` as a minimal latency test that turns a large indicator red as soon as the tracked position moves past a threshold.
+- Added `scripts/vicon_goto_continuous_viewer.py` for a continuously updated differential-drive go-to controller without the older step / stop / wait cadence.
+- Added `scripts/vicon_goto_mppi_controller.py` for an MPPI-based point-to-point go-to controller using the same Vicon visualization and JetBot control link.
+- Added `docs/continuous_goto_math.tex` and `docs/continuous_goto_math.pdf` to explain the math used by the continuous go-to controller.
+- Updated `.gitignore` so generated LaTeX helper files in `docs/` do not appear as untracked changes.
+
 ### 2026-06-11
 
 - Extended the Vicon visualization scripts to draw the room volume, robot footprint, and a horizontal heading arrow.
@@ -111,6 +120,64 @@ Usage:
 - Use `Step Time (s)` to control how long each differential-drive step lasts before stopping.
 - Use `Wait Time (s)` to control how long the script waits after each step before checking the pose again. The current default is `1.0` second.
 - The room view also shows the tracked room bounds, robot footprint, and a horizontal heading arrow based on the JetBot's Vicon green-axis forward direction.
+
+## Current Continuous Go-To Command
+
+To run the continuous differential-drive go-to controller from the laptop:
+
+```bash
+python scripts/vicon_goto_continuous_viewer.py --jetbot-host 192.168.0.86 --source-ip 192.168.0.62 --object-name jetbot
+```
+
+Prerequisite:
+Run `notebooks/jetbot_socket_server.ipynb` on the JetBot first so it can accept drive commands from the laptop.
+
+Usage:
+- Enter target `X` and `Y` coordinates in the GUI.
+- Click `Go` to drive continuously toward the target instead of moving in discrete pulses.
+- The controller continuously recomputes the left and right wheel commands from the latest Vicon pose, target distance, and heading error.
+- Click `Stop Go-To` to cancel the current target.
+- Press and hold the on-screen manual drive buttons to override the controller at any time.
+- Use `Epsilon` to set the arrival tolerance.
+- Use `Angle Correction (deg)` to correct the heading vector used both for control and for the black heading arrow in the visualization.
+
+## Current MPPI Go-To Command
+
+To run the MPPI point-to-point controller from the laptop:
+
+```bash
+python scripts/vicon_goto_mppi_controller.py --jetbot-host 192.168.0.86 --source-ip 192.168.0.62 --object-name jetbot
+```
+
+Prerequisite:
+Run `notebooks/jetbot_socket_server.ipynb` on the JetBot first so it can accept drive commands from the laptop.
+
+Usage:
+- Enter target `X` and `Y` coordinates in the GUI.
+- Click `Go` to let the MPPI controller sample short left/right command sequences and choose a command that drives toward the target.
+- This version is currently only for point-to-point target reaching. It does not include path following or obstacle costs yet.
+- Click `Stop Go-To` to cancel the current target.
+- Press and hold the manual drive buttons to override the controller at any time.
+- Use `Epsilon` and `Angle Correction (deg)` the same way as in the continuous controller.
+
+## Latency Test Command
+
+To test whether the raw Vicon UDP stream is arriving late on the laptop:
+
+```bash
+python scripts/vicon_motion_indicator.py --source-ip 192.168.0.62 --object-name jetbot --threshold 2.0
+```
+
+Notes:
+- The indicator turns red as soon as the tracked position moves more than the threshold from its armed baseline.
+- Use `Re-arm Here` or press `R` after each test.
+- This test showed the stream was delayed on Wi-Fi but responded immediately when the laptop was connected by wired Ethernet on the same network as the Vicon machine.
+
+## Continuous Go-To Math Note
+
+- LaTeX source: `docs/continuous_goto_math.tex`
+- Compiled PDF: `docs/continuous_goto_math.pdf`
+- The note explains the distance term, heading estimate, heading error, forward-speed schedule, steering term, and left/right wheel command equations used by `scripts/vicon_goto_continuous_viewer.py`.
 
 ### 2026-05-22
 

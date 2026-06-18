@@ -1,0 +1,213 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+
+\title{Math Behind the Continuous JetBot Go-To Controller}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Purpose}
+
+This note explains the control law implemented in
+\texttt{scripts/vicon\_goto\_continuous\_viewer.py}. The controller uses the
+latest Vicon pose of the JetBot and continuously computes left and right motor
+commands that steer the robot toward a target point in the plane.
+
+\section{State and Target}
+
+Let the robot position in the Vicon plane be
+\[
+\mathbf{p} =
+\begin{bmatrix}
+x \\
+y
+\end{bmatrix},
+\]
+and let the target position be
+\[
+\mathbf{p}_d =
+\begin{bmatrix}
+x_d \\
+y_d
+\end{bmatrix}.
+\]
+
+The displacement to the target is
+\[
+\Delta \mathbf{p} =
+\mathbf{p}_d - \mathbf{p}
+=
+\begin{bmatrix}
+\Delta x \\
+\Delta y
+\end{bmatrix}
+=
+\begin{bmatrix}
+x_d - x \\
+y_d - y
+\end{bmatrix}.
+\]
+
+The distance to the goal is
+\[
+r = \lVert \Delta \mathbf{p} \rVert_2
+= \sqrt{(\Delta x)^2 + (\Delta y)^2}.
+\]
+
+This corresponds to the code lines that compute
+\texttt{dx}, \texttt{dy}, and \texttt{distance}.
+
+\section{Heading Estimate}
+
+The Vicon rigid body provides a full 3D orientation. The controller extracts
+the robot's physical forward axis from the rotated body-$Y$ direction and then
+uses only its projection onto the ground plane.
+
+Let $\theta$ denote the robot heading in the horizontal plane. The script
+computes
+\[
+\theta = \operatorname{atan2}(f_y, f_x) + \delta,
+\]
+where:
+\begin{itemize}
+\item $(f_x, f_y)$ is the horizontal forward direction from the Vicon pose,
+\item $\delta$ is the user-entered angle correction in radians.
+\end{itemize}
+
+The desired target heading is
+\[
+\theta_d = \operatorname{atan2}(\Delta y, \Delta x).
+\]
+
+The heading error is then wrapped to $(-\pi, \pi]$:
+\[
+e_\theta = \operatorname{wrapToPi}(\theta_d - \theta).
+\]
+
+\section{Arrival Condition}
+
+If the robot is already close enough to the target, the controller stops:
+\[
+\text{if } r \le \varepsilon, \quad u_L = 0,\; u_R = 0,
+\]
+where $\varepsilon$ is the user-selected goal tolerance.
+
+\section{Forward-Speed Schedule}
+
+The controller uses a base forward speed that depends on the target distance.
+Let:
+\begin{itemize}
+\item $v_{\max}$ be the nominal forward speed (\texttt{self.\_speed}),
+\item $v_{\min}$ be the minimum forward speed near the goal
+(\texttt{self.\_min\_forward\_speed}),
+\item $r_s$ be the slow radius (\texttt{self.\_slow\_radius}).
+\end{itemize}
+
+Then the base forward term is
+\[
+v_{\text{base}} =
+\begin{cases}
+v_{\max}, & r \ge r_s, \\
+v_{\min} + (v_{\max} - v_{\min}) \dfrac{r}{r_s}, & r < r_s.
+\end{cases}
+\]
+
+So outside the slow radius the controller uses full commanded forward speed,
+and inside the slow radius it linearly ramps down toward $v_{\min}$.
+
+\section{Heading-Alignment Scaling}
+
+The controller reduces forward motion when the robot is pointed away from the
+target. It computes
+\[
+a = \max(0, \cos e_\theta).
+\]
+
+Then the actual forward command becomes
+\[
+v = v_{\text{base}} a^2.
+\]
+
+This has a useful effect:
+\begin{itemize}
+\item if $e_\theta \approx 0$, then $\cos e_\theta \approx 1$ and $v$ stays large,
+\item if the robot is moderately misaligned, $v$ is reduced,
+\item if the robot points more than $90^\circ$ away from the target, then
+$\cos e_\theta < 0$, so $a = 0$ and the forward term becomes zero.
+\end{itemize}
+
+\section{Steering Term}
+
+The steering command is proportional to heading error:
+\[
+\omega = \operatorname{sat}\!\left(k_\theta e_\theta,\; -u_{\text{turn}},\; u_{\text{turn}}\right),
+\]
+where:
+\begin{itemize}
+\item $k_\theta$ is the heading gain (\texttt{self.\_heading\_gain}),
+\item $u_{\text{turn}}$ is the turn-speed limit (\texttt{self.\_turn\_speed}),
+\item $\operatorname{sat}(x, a, b)$ clamps $x$ into the interval $[a,b]$.
+\end{itemize}
+
+\section{Differential-Drive Motor Commands}
+
+Finally, the left and right motor commands are
+\[
+u_L = \operatorname{sat}(v - \omega,\; -1,\; 1),
+\qquad
+u_R = \operatorname{sat}(v + \omega,\; -1,\; 1).
+\]
+
+This is the core differential-drive mixing rule:
+\begin{itemize}
+\item the shared term $v$ pushes both wheels forward,
+\item the signed steering term $\omega$ speeds one wheel up and slows the other down,
+\item clamping keeps the commands inside the valid motor range.
+\end{itemize}
+
+\section{Controller Interpretation}
+
+Putting everything together, each control cycle does the following:
+\begin{enumerate}
+\item read the latest Vicon pose,
+\item compute the target displacement and distance,
+\item compute current heading and heading error,
+\item stop if the robot is inside the goal tolerance,
+\item choose a base forward speed from the distance,
+\item attenuate forward motion if the heading is poor,
+\item compute a bounded steering correction,
+\item convert forward plus steering into left and right wheel speeds.
+\end{enumerate}
+
+In compact form,
+\begin{align*}
+r &= \sqrt{(\Delta x)^2 + (\Delta y)^2}, \\
+\theta_d &= \operatorname{atan2}(\Delta y, \Delta x), \\
+e_\theta &= \operatorname{wrapToPi}(\theta_d - \theta), \\
+v_{\text{base}} &=
+\begin{cases}
+v_{\max}, & r \ge r_s, \\
+v_{\min} + (v_{\max} - v_{\min}) \dfrac{r}{r_s}, & r < r_s,
+\end{cases} \\
+v &= v_{\text{base}} \max(0, \cos e_\theta)^2, \\
+\omega &= \operatorname{sat}(k_\theta e_\theta,\; -u_{\text{turn}},\; u_{\text{turn}}), \\
+u_L &= \operatorname{sat}(v - \omega,\; -1,\; 1), \\
+u_R &= \operatorname{sat}(v + \omega,\; -1,\; 1).
+\end{align*}
+
+\section{Connection to the Code}
+
+The most relevant code block is in
+\texttt{ContinuousGoToController.run()}, especially the section around:
+\begin{itemize}
+\item pose and distance computation,
+\item heading and heading-error computation,
+\item slow-radius logic,
+\item forward/steering mixing,
+\item left/right command output.
+\end{itemize}
+
+\end{document}
