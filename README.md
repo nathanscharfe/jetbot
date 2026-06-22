@@ -56,6 +56,11 @@ Result:
 
 ## Session Log
 
+### 2026-06-22
+
+- Added `scripts/vicon_goto_mppi_obstacle_controller.py` for MPPI-based target reaching that treats every other tracked Vicon object as a live obstacle.
+- Visualized obstacle safety radii in the 3D room view so it is easier to see what the MPPI controller is trying to avoid.
+
 ### 2026-06-18
 
 - Confirmed the Vicon UDP stream had about `1-2` seconds of latency on the laptop over Wi-Fi, while the same indicator reacted immediately on the Vicon machine and over wired Ethernet.
@@ -159,6 +164,28 @@ Usage:
 - Click `Stop Go-To` to cancel the current target.
 - Press and hold the manual drive buttons to override the controller at any time.
 - Use `Epsilon` and `Angle Correction (deg)` the same way as in the continuous controller.
+
+## Current MPPI Obstacle Command
+
+To run the obstacle-aware MPPI controller from the laptop:
+
+```bash
+python scripts/vicon_goto_mppi_obstacle_controller.py --jetbot-host 192.168.0.86 --source-ip 192.168.0.62 --object-name jetbot
+```
+
+Prerequisite:
+Run `notebooks/jetbot_socket_server.ipynb` on the JetBot first so it can accept drive commands from the laptop.
+
+Usage:
+- Enter target `X` and `Y` coordinates in the GUI.
+- Click `Go` to let MPPI sample short wheel-command sequences and choose one that both approaches the target and avoids the other tracked Vicon objects.
+- Every visible tracked object other than `jetbot` is treated as an obstacle automatically.
+- The orange/red floor circles show the obstacle safety radius used by the rollout cost.
+- Click `Stop Go-To` to cancel the current target.
+- Press and hold the manual drive buttons to override the controller at any time.
+- Use `Epsilon` and `Angle Correction (deg)` the same way as in the continuous and point-to-point MPPI controllers.
+- Current obstacle-controller defaults are `Epsilon = 60 mm` and `Angle Correction = 40 deg`.
+- Optional CLI tuning is available through `--obstacle-radius`, `--obstacle-influence-radius`, `--obstacle-cost-weight`, and `--obstacle-collision-cost`.
 
 ## Latency Test Command
 
