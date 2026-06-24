@@ -1,12 +1,12 @@
 """
-Vicon room controller with MPPI go-to-target control for JetBot.
+Vicon room controller with MPPI go-to-target control.
 
-Run this on the laptop while `notebooks/jetbot_socket_server.ipynb` is running on
-the JetBot. The script:
+Run this on the laptop. The script:
 - receives the Vicon UDP Object Stream
 - shows the room and the robot pose in 3D
 - lets the user enter a target X/Y coordinate and click Go
 - uses MPPI to continuously choose differential-drive commands toward the target
+- can command either the JetBot socket server or the Arduino Bluetooth robot
 - stops automatically once the robot gets within an epsilon of the target
 
 This version does not include obstacle costs or path-following logic yet. It is
@@ -27,13 +27,8 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.lines import Line2D
 from matplotlib.widgets import Button, TextBox
 
-from vicon_teleop_viewer import (
-    DEFAULT_OBJECT_NAME,
-    DEFAULT_VICON_SOURCE_IP,
-    DriveState,
-    TeleopClient,
-    clamp,
-)
+from drive_backends import DEFAULT_DRIVE_BACKEND, DRIVE_BACKEND_CHOICES, DriveState, clamp, create_drive_client
+from vicon_teleop_viewer import DEFAULT_OBJECT_NAME, DEFAULT_VICON_SOURCE_IP
 from vicon_udp_viewer import (
     SharedState,
     ViconReceiver,
@@ -48,6 +43,8 @@ from vicon_udp_viewer import (
 
 DEFAULT_JETBOT_HOST = "192.168.0.86"
 DEFAULT_JETBOT_PORT = 8765
+DEFAULT_SERIAL_BAUD = 9600
+DEFAULT_SERIAL_MAX_PWM = 255
 UNSET = object()
 
 
@@ -82,6 +79,7 @@ class MPPIController(threading.Thread):
         speed: float,
         turn_speed: float,
         min_forward_speed: float,
+        slow_near_target: bool,
         epsilon: float,
         slow_radius: float,
         heading_gain: float,
@@ -109,6 +107,7 @@ class MPPIController(threading.Thread):
         self._speed = speed
         self._turn_speed = turn_speed
         self._min_forward_speed = min_forward_speed
+        self._slow_near_target = slow_near_target
         self._slow_radius = slow_radius
         self._heading_gain = heading_gain
         self._period = 1.0 / max(control_rate_hz, 1.0)
@@ -245,9 +244,8 @@ class MPPIController(threading.Thread):
         dy = target_y - y
         distance = math.hypot(dx, dy)
 
-        if distance >= self._slow_radius:
-            base_forward = self._speed
-        else:
+        base_forward = self._speed
+        if self._slow_near_target and distance < self._slow_radius:
             blend = max(distance / max(self._slow_radius, 1e-6), 0.0)
             base_forward = self._min_forward_speed + (self._speed - self._min_forward_speed) * blend
             base_forward = min(base_forward, self._speed)
@@ -491,7 +489,10 @@ class MPPIController(threading.Thread):
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Receive the Vicon UDP stream, show the room in 3D, and drive the JetBot to a target with an MPPI controller."
+        description=(
+            "Receive the Vicon UDP stream, show the room in 3D, and drive the selected robot "
+            "to a target with an MPPI controller."
+        )
     )
     parser.add_argument("--bind-host", default="0.0.0.0")
     parser.add_argument("--source-ip", default=DEFAULT_VICON_SOURCE_IP)
@@ -528,11 +529,20 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-forward-speed", type=float, default=0.22)
     parser.add_argument("--epsilon", type=float, default=150.0, help="Target tolerance in Vicon translation units.")
     parser.add_argument("--slow-radius", type=float, default=700.0, help="Start slowing down within this radius.")
+    parser.add_argument(
+        "--slow-near-target",
+        action="store_true",
+        help="Enable the older distance-based forward-speed ramp near the target.",
+    )
     parser.add_argument("--heading-gain", type=float, default=0.9)
     parser.add_argument("--forward-offset-deg", type=float, default=0.0)
     parser.add_argument("--control-rate-hz", type=float, default=15.0)
+    parser.add_argument("--drive-backend", choices=DRIVE_BACKEND_CHOICES, default=DEFAULT_DRIVE_BACKEND)
     parser.add_argument("--jetbot-host", default=DEFAULT_JETBOT_HOST)
     parser.add_argument("--jetbot-port", type=int, default=DEFAULT_JETBOT_PORT)
+    parser.add_argument("--serial-port", default="", help="Bluetooth COM port for the Arduino backend, for example COM6.")
+    parser.add_argument("--serial-baud", type=int, default=DEFAULT_SERIAL_BAUD)
+    parser.add_argument("--serial-max-pwm", type=int, default=DEFAULT_SERIAL_MAX_PWM)
     parser.add_argument("--send-rate-hz", type=float, default=20.0)
     parser.add_argument("--horizon-steps", type=int, default=15)
     parser.add_argument("--num-samples", type=int, default=128)
@@ -553,7 +563,8 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = make_parser().parse_args()
+    parser = make_parser()
+    args = parser.parse_args()
     selected_object_name = args.object_name or None
     display_scale = 1.0 if args.units == "mm" else 0.001
     room_center = tuple(value * display_scale for value in args.room_center)
@@ -577,13 +588,20 @@ def main() -> None:
     )
 
     drive_state = DriveState()
-    teleop_client = TeleopClient(
-        host=args.jetbot_host,
-        port=args.jetbot_port,
-        drive_state=drive_state,
-        send_rate_hz=args.send_rate_hz,
-        verbose=args.verbose,
-    )
+    try:
+        teleop_client = create_drive_client(
+            drive_backend=args.drive_backend,
+            drive_state=drive_state,
+            send_rate_hz=args.send_rate_hz,
+            verbose=args.verbose,
+            jetbot_host=args.jetbot_host,
+            jetbot_port=args.jetbot_port,
+            serial_port=args.serial_port,
+            serial_baud=args.serial_baud,
+            serial_max_pwm=args.serial_max_pwm,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     controller = MPPIController(
         shared_state=shared_state,
@@ -592,6 +610,7 @@ def main() -> None:
         speed=args.speed,
         turn_speed=args.turn_speed,
         min_forward_speed=args.min_forward_speed,
+        slow_near_target=args.slow_near_target,
         epsilon=args.epsilon,
         slow_radius=args.slow_radius,
         heading_gain=args.heading_gain,
@@ -866,7 +885,8 @@ def main() -> None:
         status_lines.extend(
             [
                 "",
-                f"JetBot server: {teleop_status['host']}:{teleop_status['port']}",
+                f"Drive backend: {teleop_status['backend']}",
+                f"Drive endpoint: {teleop_status['endpoint']}",
                 f"Control link: {'connected' if teleop_status['connected'] else 'disconnected'}",
                 f"Drive command: ({drive_command.left:.2f}, {drive_command.right:.2f})",
                 f"Controller mode: {target_state.mode}",

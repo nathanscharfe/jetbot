@@ -56,6 +56,13 @@ Result:
 
 ## Session Log
 
+### 2026-06-24
+
+- Added `scripts/drive_backends.py` to share the JetBot socket transport and the Arduino Bluetooth serial transport across the laptop-side control tools.
+- Added `scripts/arduino_bluetooth_teleop.py` for direct Bluetooth teleoperation of the 4-wheel robot over a COM-port link.
+- Updated `scripts/vicon_goto_mppi_controller.py` and `scripts/vicon_goto_mppi_obstacle_controller.py` so either script can drive the JetBot socket backend or the Arduino Bluetooth backend with the same Vicon UI.
+- Restored the obstacle-controller GUI to the lighter `Epsilon` plus `Angle Correction (deg)` tuning layout after the larger live-parameter panel made the UI unresponsive.
+
 ### 2026-06-22
 
 - Added `scripts/vicon_goto_mppi_obstacle_controller.py` for MPPI-based target reaching that treats every other tracked Vicon object as a live obstacle.
@@ -102,6 +109,20 @@ Run `notebooks/jetbot_socket_server.ipynb` on the JetBot first so it can accept 
 Current default teleoperation tuning in `scripts/vicon_teleop_viewer.py`:
 - `speed = 0.7`
 - `turn_speed = 0.5`
+
+## Arduino Bluetooth Teleop Command
+
+To teleoperate the 4-wheel Arduino robot directly over Bluetooth from the laptop:
+
+```bash
+python scripts/arduino_bluetooth_teleop.py --serial-port COM6
+```
+
+Usage:
+- Pair the laptop to the robot's Bluetooth module first so it appears as a COM port such as `COM6`.
+- Make sure the laptop Python environment has `pyserial` available.
+- Press and hold the on-screen buttons to drive.
+- Use `Speed` and `Turn Speed` to change the normalized command values sent to the Arduino backend.
 
 ## Current Go-To Command
 
@@ -154,6 +175,12 @@ To run the MPPI point-to-point controller from the laptop:
 python scripts/vicon_goto_mppi_controller.py --jetbot-host 192.168.0.86 --source-ip 192.168.0.62 --object-name jetbot
 ```
 
+For the 4-wheel Bluetooth robot instead:
+
+```bash
+python scripts/vicon_goto_mppi_controller.py --drive-backend arduino-bluetooth --serial-port COM6 --source-ip 192.168.0.62 --object-name 4_wheel
+```
+
 Prerequisite:
 Run `notebooks/jetbot_socket_server.ipynb` on the JetBot first so it can accept drive commands from the laptop.
 
@@ -164,6 +191,7 @@ Usage:
 - Click `Stop Go-To` to cancel the current target.
 - Press and hold the manual drive buttons to override the controller at any time.
 - Use `Epsilon` and `Angle Correction (deg)` the same way as in the continuous controller.
+- Use `--drive-backend arduino-bluetooth --serial-port COM6` when the controller should command the 4-wheel Arduino robot instead of the JetBot.
 
 ## Current MPPI Obstacle Command
 
@@ -171,6 +199,12 @@ To run the obstacle-aware MPPI controller from the laptop:
 
 ```bash
 python scripts/vicon_goto_mppi_obstacle_controller.py --jetbot-host 192.168.0.86 --source-ip 192.168.0.62 --object-name jetbot
+```
+
+For the 4-wheel Bluetooth robot instead:
+
+```bash
+python scripts/vicon_goto_mppi_obstacle_controller.py --drive-backend arduino-bluetooth --serial-port COM6 --source-ip 192.168.0.62 --object-name 4_wheel
 ```
 
 Prerequisite:
@@ -185,6 +219,7 @@ Usage:
 - Press and hold the manual drive buttons to override the controller at any time.
 - Use `Epsilon` and `Angle Correction (deg)` the same way as in the continuous and point-to-point MPPI controllers.
 - Current obstacle-controller defaults are `Epsilon = 60 mm` and `Angle Correction = 40 deg`.
+- The obstacle-controller window intentionally keeps only those two tuning boxes on-screen so the UI stays responsive.
 - Optional CLI tuning is available through `--obstacle-radius`, `--obstacle-influence-radius`, `--obstacle-cost-weight`, and `--obstacle-collision-cost`.
 
 ## Latency Test Command

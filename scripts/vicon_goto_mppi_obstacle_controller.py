@@ -1,12 +1,12 @@
 """
 Vicon room controller with MPPI go-to-target control and obstacle avoidance.
 
-Run this on the laptop while `notebooks/jetbot_socket_server.ipynb` is running on
-the JetBot. The script:
+Run this on the laptop. The script:
 - receives the Vicon UDP Object Stream
 - shows the room, the robot pose, and other tracked objects in 3D
 - lets the user enter a target X/Y coordinate and click Go
 - uses MPPI to continuously choose differential-drive commands toward the target
+- can command either the JetBot socket server or the Arduino Bluetooth robot
 - treats every other tracked Vicon object as an obstacle in the MPPI rollout cost
 - stops automatically once the robot gets within an epsilon of the target
 """
@@ -24,13 +24,8 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.lines import Line2D
 from matplotlib.widgets import Button, TextBox
 
-from vicon_teleop_viewer import (
-    DEFAULT_OBJECT_NAME,
-    DEFAULT_VICON_SOURCE_IP,
-    DriveState,
-    TeleopClient,
-    clamp,
-)
+from drive_backends import DEFAULT_DRIVE_BACKEND, DRIVE_BACKEND_CHOICES, DriveState, clamp, create_drive_client
+from vicon_teleop_viewer import DEFAULT_OBJECT_NAME, DEFAULT_VICON_SOURCE_IP
 from vicon_udp_viewer import (
     SharedState,
     ViconReceiver,
@@ -45,6 +40,8 @@ from vicon_udp_viewer import (
 
 DEFAULT_JETBOT_HOST = "192.168.0.86"
 DEFAULT_JETBOT_PORT = 8765
+DEFAULT_SERIAL_BAUD = 9600
+DEFAULT_SERIAL_MAX_PWM = 255
 UNSET = object()
 
 
@@ -139,6 +136,7 @@ class ObstacleAwareMPPIController(threading.Thread):
         speed: float,
         turn_speed: float,
         min_forward_speed: float,
+        slow_near_target: bool,
         epsilon: float,
         slow_radius: float,
         heading_gain: float,
@@ -167,12 +165,6 @@ class ObstacleAwareMPPIController(threading.Thread):
         self._shared_state = shared_state
         self._selected_name = selected_name
         self._drive_state = drive_state
-        self._speed = speed
-        self._turn_speed = turn_speed
-        self._min_forward_speed = min_forward_speed
-        self._slow_radius = slow_radius
-        self._heading_gain = heading_gain
-        self._period = 1.0 / max(control_rate_hz, 1.0)
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._state = TargetState()
@@ -180,7 +172,13 @@ class ObstacleAwareMPPIController(threading.Thread):
             epsilon=epsilon,
             heading_offset_deg=heading_offset_deg,
         )
-
+        self._speed = speed
+        self._turn_speed = turn_speed
+        self._min_forward_speed = min_forward_speed
+        self._slow_near_target = slow_near_target
+        self._slow_radius = slow_radius
+        self._heading_gain = heading_gain
+        self._period = 1.0 / max(control_rate_hz, 1.0)
         self._horizon_steps = max(horizon_steps, 1)
         self._num_samples = max(num_samples, 1)
         self._temperature = max(temperature, 1e-6)
@@ -188,8 +186,7 @@ class ObstacleAwareMPPIController(threading.Thread):
         self._model_linear_speed = model_linear_speed
         self._model_angular_speed = model_angular_speed
         self._heuristic_blend = clamp(heuristic_blend, 0.0, 1.0)
-
-        self._distance_scale = max(self._slow_radius, 1.0)
+        self._distance_scale = max(slow_radius, 1.0)
         self._distance_cost_weight = distance_cost_weight
         self._heading_cost_weight = heading_cost_weight
         self._terminal_distance_cost_weight = terminal_distance_cost_weight
@@ -201,8 +198,7 @@ class ObstacleAwareMPPIController(threading.Thread):
         self._obstacle_influence_radius = max(obstacle_influence_radius, 1e-6)
         self._obstacle_cost_weight = max(obstacle_cost_weight, 0.0)
         self._obstacle_collision_cost = max(obstacle_collision_cost, 0.0)
-
-        self._nominal_controls = [(0.0, 0.0)] * self._horizon_steps
+        self._nominal_controls: list[tuple[float, float]] = [(0.0, 0.0)] * self._horizon_steps
         self._rng = random.Random()
 
     def set_target(self, target_x: float, target_y: float) -> None:
@@ -310,9 +306,8 @@ class ObstacleAwareMPPIController(threading.Thread):
         dy = target_y - y
         distance = math.hypot(dx, dy)
 
-        if distance >= self._slow_radius:
-            base_forward = self._speed
-        else:
+        base_forward = self._speed
+        if self._slow_near_target and distance < self._slow_radius:
             blend = max(distance / max(self._slow_radius, 1e-6), 0.0)
             base_forward = self._min_forward_speed + (self._speed - self._min_forward_speed) * blend
             base_forward = min(base_forward, self._speed)
@@ -589,7 +584,7 @@ class ObstacleAwareMPPIController(threading.Thread):
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Receive the Vicon UDP stream, show the room in 3D, and drive the JetBot "
+            "Receive the Vicon UDP stream, show the room in 3D, and drive the selected robot "
             "to a target with an obstacle-aware MPPI controller."
         )
     )
@@ -628,11 +623,20 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-forward-speed", type=float, default=0.22)
     parser.add_argument("--epsilon", type=float, default=60.0, help="Target tolerance in Vicon translation units.")
     parser.add_argument("--slow-radius", type=float, default=700.0, help="Start slowing down within this radius.")
+    parser.add_argument(
+        "--slow-near-target",
+        action="store_true",
+        help="Enable the older distance-based forward-speed ramp near the target.",
+    )
     parser.add_argument("--heading-gain", type=float, default=0.9)
     parser.add_argument("--forward-offset-deg", type=float, default=40.0)
     parser.add_argument("--control-rate-hz", type=float, default=15.0)
+    parser.add_argument("--drive-backend", choices=DRIVE_BACKEND_CHOICES, default=DEFAULT_DRIVE_BACKEND)
     parser.add_argument("--jetbot-host", default=DEFAULT_JETBOT_HOST)
     parser.add_argument("--jetbot-port", type=int, default=DEFAULT_JETBOT_PORT)
+    parser.add_argument("--serial-port", default="", help="Bluetooth COM port for the Arduino backend, for example COM6.")
+    parser.add_argument("--serial-baud", type=int, default=DEFAULT_SERIAL_BAUD)
+    parser.add_argument("--serial-max-pwm", type=int, default=DEFAULT_SERIAL_MAX_PWM)
     parser.add_argument("--send-rate-hz", type=float, default=20.0)
     parser.add_argument("--horizon-steps", type=int, default=15)
     parser.add_argument("--num-samples", type=int, default=128)
@@ -677,7 +681,8 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = make_parser().parse_args()
+    parser = make_parser()
+    args = parser.parse_args()
     selected_object_name = args.object_name or None
     display_scale = 1.0 if args.units == "mm" else 0.001
     room_center = tuple(value * display_scale for value in args.room_center)
@@ -701,13 +706,20 @@ def main() -> None:
     )
 
     drive_state = DriveState()
-    teleop_client = TeleopClient(
-        host=args.jetbot_host,
-        port=args.jetbot_port,
-        drive_state=drive_state,
-        send_rate_hz=args.send_rate_hz,
-        verbose=args.verbose,
-    )
+    try:
+        teleop_client = create_drive_client(
+            drive_backend=args.drive_backend,
+            drive_state=drive_state,
+            send_rate_hz=args.send_rate_hz,
+            verbose=args.verbose,
+            jetbot_host=args.jetbot_host,
+            jetbot_port=args.jetbot_port,
+            serial_port=args.serial_port,
+            serial_baud=args.serial_baud,
+            serial_max_pwm=args.serial_max_pwm,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     controller = ObstacleAwareMPPIController(
         shared_state=shared_state,
@@ -716,6 +728,7 @@ def main() -> None:
         speed=args.speed,
         turn_speed=args.turn_speed,
         min_forward_speed=args.min_forward_speed,
+        slow_near_target=args.slow_near_target,
         epsilon=args.epsilon,
         slow_radius=args.slow_radius,
         heading_gain=args.heading_gain,
@@ -749,14 +762,15 @@ def main() -> None:
     ax = fig.add_axes([0.26, 0.36, 0.56, 0.56], projection="3d")
     status_ax = fig.add_axes([0.03, 0.39, 0.20, 0.51])
     status_ax.axis("off")
+    initial_tuning = controller.tuning_snapshot()
 
-    fig.text(0.08, 0.315, "MPPI Obstacle Controller", fontsize=11, fontweight="bold")
+    fig.text(0.08, 0.315, "Go-To Target", fontsize=11, fontweight="bold")
+    fig.text(0.08, 0.205, "Controller Tuning", fontsize=11, fontweight="bold")
+    fig.text(0.50, 0.095, "Manual Drive (press and hold)", fontsize=11, fontweight="bold", ha="center")
     fig.text(0.08, 0.292, f"Target X ({args.units})", fontsize=9)
     fig.text(0.26, 0.292, f"Target Y ({args.units})", fontsize=9)
-    fig.text(0.08, 0.205, "Controller Tuning", fontsize=11, fontweight="bold")
     fig.text(0.08, 0.182, f"Epsilon ({args.units})", fontsize=9)
     fig.text(0.24, 0.182, "Angle Correction (deg)", fontsize=9)
-    fig.text(0.50, 0.095, "Manual Drive (press and hold)", fontsize=11, fontweight="bold", ha="center")
 
     x_box_ax = fig.add_axes([0.08, 0.235, 0.14, 0.055])
     y_box_ax = fig.add_axes([0.26, 0.235, 0.14, 0.055])
@@ -768,8 +782,8 @@ def main() -> None:
 
     x_text = TextBox(x_box_ax, "", initial="0")
     y_text = TextBox(y_box_ax, "", initial="0")
-    epsilon_text = TextBox(epsilon_box_ax, "", initial=f"{args.epsilon * display_scale:.1f}")
-    offset_text = TextBox(offset_box_ax, "", initial=f"{args.forward_offset_deg:.1f}")
+    epsilon_text = TextBox(epsilon_box_ax, "", initial=f"{initial_tuning.epsilon * display_scale:.1f}")
+    offset_text = TextBox(offset_box_ax, "", initial=f"{initial_tuning.heading_offset_deg:.1f}")
     go_button = Button(go_button_ax, "Go", color="#8fd19e", hovercolor="#d5f5e3")
     stop_button = Button(stop_button_ax, "Stop Go-To", color="#f5a3a3", hovercolor="#fadbd8")
     apply_button = Button(apply_button_ax, "Apply", color="#aed6f1", hovercolor="#d6eaf8")
@@ -809,6 +823,9 @@ def main() -> None:
     def on_stop_clicked(_event) -> None:
         controller.clear_target("Stopped by user.")
 
+    def on_apply_clicked(_event) -> None:
+        apply_tuning_from_boxes()
+
     manual_button_specs = [
         {
             "label": "Left",
@@ -842,17 +859,12 @@ def main() -> None:
         },
     ]
     manual_axes_to_spec: dict[object, dict[str, object]] = {}
-    manual_button_widgets: list[Button] = []
 
     for spec in manual_button_specs:
         button_ax = fig.add_axes(spec["rect"])
         button = Button(button_ax, spec["label"], color=spec["color"], hovercolor="#dddddd")
         button.label.set_fontsize(10)
         manual_axes_to_spec[button_ax] = spec
-        manual_button_widgets.append(button)
-
-    def on_apply_clicked(_event) -> None:
-        apply_tuning_from_boxes()
 
     def on_mouse_press(event) -> None:
         nonlocal active_manual_command
@@ -1025,7 +1037,8 @@ def main() -> None:
         status_lines.extend(
             [
                 "",
-                f"JetBot server: {teleop_status['host']}:{teleop_status['port']}",
+                f"Drive backend: {teleop_status['backend']}",
+                f"Drive endpoint: {teleop_status['endpoint']}",
                 f"Control link: {'connected' if teleop_status['connected'] else 'disconnected'}",
                 f"Drive command: ({drive_command.left:.2f}, {drive_command.right:.2f})",
                 f"Controller mode: {target_state.mode}",
