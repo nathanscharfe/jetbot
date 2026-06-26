@@ -1,0 +1,380 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+
+\title{Core Math Behind \texttt{vicon\_goto\_mppi\_controller.py}}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Purpose}
+
+This note explains the core control math implemented in
+\texttt{scripts/vicon\_goto\_mppi\_controller.py}. The goal of that script is
+to drive a differential-drive JetBot from its current Vicon pose to a planar
+target $(x_d, y_d)$ by repeatedly solving a short finite-horizon control
+problem with Model Predictive Path Integral (MPPI) control.
+
+The main code blocks discussed here are:
+\begin{itemize}
+\item heuristic command seed: lines 236--264,
+\item rollout dynamics model: lines 266--283,
+\item rollout cost: lines 285--326,
+\item heuristic rollout construction: lines 328--343,
+\item MPPI update: lines 345--419,
+\item outer control loop: lines 421--489.
+\end{itemize}
+
+\section{State, Target, and Heading}
+
+In the outer loop (lines 443--456), the script reads the latest Vicon pose and
+computes:
+\[
+\Delta x = x_d - x,
+\qquad
+\Delta y = y_d - y,
+\qquad
+r = \sqrt{(\Delta x)^2 + (\Delta y)^2}.
+\]
+
+The target heading is
+\[
+\theta_d = \operatorname{atan2}(\Delta y, \Delta x).
+\]
+
+The robot heading is obtained from the Vicon orientation by rotating the body
+$Y$ axis into the world frame, projecting onto the floor plane, and applying a
+user-entered angle correction. In compact form,
+\[
+\theta = \operatorname{wrapToPi}\!\left(\operatorname{atan2}(f_y, f_x) + \delta\right),
+\]
+where $(f_x,f_y)$ is the horizontal forward vector and $\delta$ is the angle
+correction. The heading error is then
+\[
+e_\theta = \operatorname{wrapToPi}(\theta_d - \theta).
+\]
+
+If $r \le \varepsilon$, the controller stops immediately (lines 458--469).
+
+\section{Heuristic Command Used as the MPPI Seed}
+
+Before sampling random control perturbations, the script builds a simple
+goal-seeking differential-drive command in \texttt{\_heuristic\_command()}
+(lines 236--264). This heuristic is not the final controller by itself; it is
+the warm-start policy that biases MPPI toward sensible commands.
+
+\subsection{Distance-Based Forward Speed}
+
+Let:
+\begin{itemize}
+\item $v_{\max} =$ \texttt{self.\_speed},
+\item $v_{\min} =$ \texttt{self.\_min\_forward\_speed},
+\item $r_s =$ \texttt{self.\_slow\_radius}.
+\end{itemize}
+
+Then the base forward command is
+\[
+v_{\mathrm{base}} =
+\begin{cases}
+v_{\max}, & r \ge r_s, \\
+v_{\min} + (v_{\max} - v_{\min}) \dfrac{r}{r_s}, & r < r_s.
+\end{cases}
+\]
+
+This matches lines 248--253.
+
+\subsection{Heading Alignment and Steering}
+
+The same block computes
+\[
+a = \max(0, \cos e_\theta),
+\qquad
+v = v_{\mathrm{base}} a^2,
+\]
+so the robot reduces forward motion when it is poorly aligned with the target
+(lines 255--258).
+
+Steering is proportional to heading error and then clamped:
+\[
+\omega = \operatorname{clamp}\!\left(k_\theta e_\theta,\; -u_{\mathrm{turn}},\; u_{\mathrm{turn}}\right),
+\]
+where $k_\theta =$ \texttt{self.\_heading\_gain} and
+$u_{\mathrm{turn}} =$ \texttt{self.\_turn\_speed} (lines 259--263).
+
+The heuristic left and right wheel commands are
+\[
+u_L = \operatorname{clamp}(v - \omega),
+\qquad
+u_R = \operatorname{clamp}(v + \omega),
+\]
+as returned on line 264. Here the one-argument \texttt{clamp()} means clamp to
+the motor command range, effectively $[-1,1]$.
+
+\section{Internal Rollout Dynamics Model}
+
+The MPPI controller needs a fast predictive model to evaluate candidate command
+sequences. The model in \texttt{\_simulate\_step()} (lines 266--283) uses a
+simple differential-drive abstraction.
+
+For wheel commands $(u_L, u_R)$:
+\[
+u_f = \frac{u_L + u_R}{2},
+\qquad
+u_\omega = \frac{u_R - u_L}{2}.
+\]
+
+These are interpreted as forward and turn commands. They are converted into
+physical rates by calibration constants
+\texttt{self.\_model\_linear\_speed} and
+\texttt{self.\_model\_angular\_speed}:
+\[
+v = c_v u_f,
+\qquad
+\omega = c_\omega u_\omega.
+\]
+
+Over one controller period $\Delta t =$ \texttt{self.\_period}, the predicted
+state update is
+\begin{align*}
+x_{k+1} &= x_k + v \cos(\theta_k)\,\Delta t, \\
+y_{k+1} &= y_k + v \sin(\theta_k)\,\Delta t, \\
+\theta_{k+1} &= \operatorname{wrapToPi}(\theta_k + \omega \Delta t).
+\end{align*}
+
+This is exactly what lines 274--282 implement.
+
+\section{Rollout Cost Function}
+
+The cost of a candidate control sequence is computed in
+\texttt{\_sequence\_cost()} (lines 285--326). Suppose a rollout consists of
+\[
+\mathbf{u}_{0:H-1} = \left\{(u_{L,0},u_{R,0}), \dots, (u_{L,H-1},u_{R,H-1})\right\}.
+\]
+
+At each rollout step $k$, the script simulates the next state and evaluates:
+\begin{itemize}
+\item distance-to-goal penalty,
+\item heading-error penalty,
+\item control-effort penalty,
+\item control-slew penalty relative to the previous command,
+\item reverse-motion penalty.
+\end{itemize}
+
+\subsection{Stage Cost}
+
+Let
+\[
+r_k = \sqrt{(x_d - x_k)^2 + (y_d - y_k)^2},
+\qquad
+e_{\theta,k} = \operatorname{wrapToPi}\!\left(\operatorname{atan2}(y_d-y_k, x_d-x_k) - \theta_k\right).
+\]
+
+The code scales distance by
+\[
+\bar{r}_k = \frac{r_k}{r_{\mathrm{scale}}},
+\qquad
+r_{\mathrm{scale}} = \texttt{self.\_distance\_scale},
+\]
+with \texttt{self.\_distance\_scale} initialized from the slow radius.
+
+Let the previous command be $(u_{L,k-1},u_{R,k-1})$. Then the stage cost used
+by lines 308--315 can be written as
+\begin{align*}
+\ell_k
+&=
+w_r \bar{r}_k^2
++ w_\theta e_{\theta,k}^2
++ w_u \left(u_{L,k}^2 + u_{R,k}^2\right) \\
+&\quad
++ w_{\Delta u} \left((u_{L,k} - u_{L,k-1})^2 + (u_{R,k} - u_{R,k-1})^2\right)
++ w_{\mathrm{rev}} \max(-u_{f,k}, 0)^2,
+\end{align*}
+where
+\[
+u_{f,k} = \frac{u_{L,k} + u_{R,k}}{2}.
+\]
+
+The weights above correspond to:
+\begin{itemize}
+\item \texttt{self.\_distance\_cost\_weight},
+\item \texttt{self.\_heading\_cost\_weight},
+\item \texttt{self.\_control\_effort\_weight},
+\item \texttt{self.\_control\_slew\_weight},
+\item \texttt{self.\_reverse\_cost\_weight}.
+\end{itemize}
+
+\subsection{Terminal Cost}
+
+After the final simulated step, lines 319--325 add a terminal penalty:
+\[
+\phi =
+w_r^{(T)} \bar{r}_H^2
++ w_\theta^{(T)} e_{\theta,H}^2,
+\]
+using
+\texttt{self.\_terminal\_distance\_cost\_weight} and
+\texttt{self.\_terminal\_heading\_cost\_weight}.
+
+The full rollout objective is therefore
+\[
+J(\mathbf{u}_{0:H-1}) = \sum_{k=0}^{H-1} \ell_k + \phi.
+\]
+
+\section{How the Heuristic Becomes a Nominal Sequence}
+
+Lines 328--343 build a horizon-length heuristic sequence by repeatedly applying
+the heuristic command and rolling the internal model forward:
+\[
+\mathbf{u}^{\mathrm{heur}}_{0:H-1}
+=
+\left\{
+\pi_{\mathrm{heur}}(x_0,y_0,\theta_0),
+\pi_{\mathrm{heur}}(x_1,y_1,\theta_1),
+\dots
+\right\}.
+\]
+
+Then lines 354--361 combine:
+\begin{itemize}
+\item the previous cycle's shifted nominal sequence, and
+\item the fresh heuristic sequence.
+\end{itemize}
+
+If $\alpha =$ \texttt{self.\_heuristic\_blend}, the nominal sequence at step
+$k$ is:
+\[
+\mathbf{u}^{\mathrm{nom}}_k
+=
+(1-\alpha)\,\mathbf{u}^{\mathrm{shift}}_k
++ \alpha\,\mathbf{u}^{\mathrm{heur}}_k.
+\]
+
+This warm start is important: it makes the sampled rollouts less random and
+gives MPPI a plausible local baseline.
+
+\section{MPPI Sampling and Softmin Update}
+
+The core MPPI logic lives in \texttt{\_mppi\_command()} (lines 345--419).
+
+\subsection{Sampling Candidate Sequences}
+
+For each sample index $i \in \{1,\dots,N\}$ and horizon step $k$, the script
+draws Gaussian noise
+\[
+\epsilon^i_k =
+\begin{bmatrix}
+\epsilon^i_{L,k} \\
+\epsilon^i_{R,k}
+\end{bmatrix},
+\qquad
+\epsilon^i_{L,k}, \epsilon^i_{R,k}
+\sim \mathcal{N}(0,\sigma^2),
+\]
+where $\sigma =$ \texttt{self.\_noise\_std} (lines 370--379).
+
+The sampled command is
+\[
+\mathbf{u}^i_k
+=
+\operatorname{clamp}\!\left(\mathbf{u}^{\mathrm{nom}}_k + \epsilon^i_k\right).
+\]
+
+Each full candidate sequence is then scored by the rollout cost
+\[
+J_i = J(\mathbf{u}^i_{0:H-1}),
+\]
+as in lines 381--389.
+
+\subsection{Exponential Weighting}
+
+After evaluating all candidates, the controller computes the minimum cost
+\[
+J_{\min} = \min_i J_i
+\]
+and then assigns each rollout a softmin weight (lines 393--395):
+\[
+w_i = \exp\!\left(-\frac{J_i - J_{\min}}{\lambda}\right),
+\]
+where $\lambda =$ \texttt{self.\_temperature}.
+
+Subtracting $J_{\min}$ does not change the relative weighting, but it improves
+numerical stability by keeping exponents closer to zero.
+
+\subsection{Weighted Noise Update}
+
+For each horizon step $k$, the script computes the weighted mean noise:
+\[
+\bar{\epsilon}_k =
+\frac{\sum_{i=1}^N w_i \epsilon^i_k}{\sum_{i=1}^N w_i}.
+\]
+
+The nominal sequence is updated by
+\[
+\mathbf{u}^{\mathrm{new}}_k
+=
+\operatorname{clamp}\!\left(\mathbf{u}^{\mathrm{nom}}_k + \bar{\epsilon}_k\right),
+\]
+which is what lines 400--416 implement.
+
+Finally, line 419 returns only the first control:
+\[
+\mathbf{u}_{\mathrm{apply}} = \mathbf{u}^{\mathrm{new}}_0.
+\]
+
+This is the standard receding-horizon idea: optimize a short sequence, apply
+the first command, shift the horizon, and repeat on the next cycle.
+
+\section{Outer Controller Loop}
+
+The outer loop in \texttt{run()} (lines 421--489) connects the math to the
+live robot:
+\begin{enumerate}
+\item get the active target and current tuning (lines 423--424),
+\item wait if no target is active (lines 426--428),
+\item read the latest Vicon pose and verify visibility (lines 430--441),
+\item compute current planar state and heading error (lines 443--456),
+\item stop if the robot is already within $\varepsilon$ (lines 458--469),
+\item read the currently commanded wheel speeds (line 472),
+\item call \texttt{\_mppi\_command(...)} to get the next wheel command
+      (lines 473--480),
+\item send the command to the JetBot and update status (lines 482--488).
+\end{enumerate}
+
+The current wheel command is passed into the cost function so the
+control-slew term can discourage abrupt changes.
+
+\section{Compact Summary}
+
+The controller can be summarized as:
+\begin{align*}
+\text{measure current state} &\to (x,y,\theta), \\
+\text{build heuristic seed} &\to \mathbf{u}^{\mathrm{heur}}_{0:H-1}, \\
+\text{blend with shifted previous plan} &\to \mathbf{u}^{\mathrm{nom}}_{0:H-1}, \\
+\text{sample noisy sequences} &\to \mathbf{u}^i_{0:H-1}, \\
+\text{score each sequence} &\to J_i, \\
+\text{compute softmin weights} &\to w_i, \\
+\text{update the nominal plan} &\to \mathbf{u}^{\mathrm{new}}_{0:H-1}, \\
+\text{apply the first command} &\to (u_L, u_R).
+\end{align*}
+
+So the script is not using an analytic optimal-control solution. Instead, it
+uses a simple dynamics model plus many short random control perturbations, then
+keeps the perturbation directions that tend to reduce the finite-horizon cost.
+
+\section{Parameter Anchors in the File}
+
+The MPPI-related tunable parameters are declared near lines 526--550:
+\begin{itemize}
+\item speed and turning limits: lines 526--533,
+\item horizon and sample count: lines 537--540,
+\item model calibration: lines 541--542,
+\item heuristic blending: line 543,
+\item distance, heading, effort, slew, reverse, and terminal weights:
+      lines 544--550.
+\end{itemize}
+
+Those parser defaults determine the numerical behavior of the equations above.
+
+\end{document}

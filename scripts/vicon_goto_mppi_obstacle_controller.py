@@ -22,9 +22,10 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.lines import Line2D
-from matplotlib.widgets import Button, TextBox
+from matplotlib.widgets import Button, CheckButtons, TextBox
 
 from drive_backends import DEFAULT_DRIVE_BACKEND, DRIVE_BACKEND_CHOICES, DriveState, clamp, create_drive_client
+from mppi_startup_ui import show_mppi_startup_config
 from vicon_teleop_viewer import DEFAULT_OBJECT_NAME, DEFAULT_VICON_SOURCE_IP
 from vicon_udp_viewer import (
     SharedState,
@@ -199,6 +200,7 @@ class ObstacleAwareMPPIController(threading.Thread):
         self._obstacle_cost_weight = max(obstacle_cost_weight, 0.0)
         self._obstacle_collision_cost = max(obstacle_collision_cost, 0.0)
         self._nominal_controls: list[tuple[float, float]] = [(0.0, 0.0)] * self._horizon_steps
+        self._sample_heading_predictions: list[tuple[float, float, float]] = []
         self._rng = random.Random()
 
     def set_target(self, target_x: float, target_y: float) -> None:
@@ -222,6 +224,7 @@ class ObstacleAwareMPPIController(threading.Thread):
             self._state.mode = "idle"
             self._state.message = message
             self._nominal_controls = [(0.0, 0.0)] * self._horizon_steps
+            self._sample_heading_predictions = []
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -246,6 +249,10 @@ class ObstacleAwareMPPIController(threading.Thread):
                 epsilon=self._tuning.epsilon,
                 heading_offset_deg=self._tuning.heading_offset_deg,
             )
+
+    def sample_heading_snapshot(self) -> list[tuple[float, float, float]]:
+        with self._lock:
+            return list(self._sample_heading_predictions)
 
     def set_message(self, message: str) -> None:
         self._update_state(message=message)
@@ -293,6 +300,10 @@ class ObstacleAwareMPPIController(threading.Thread):
     def _current_target(self) -> tuple[bool, float, float]:
         with self._lock:
             return self._state.active, self._state.target_x, self._state.target_y
+
+    def _set_sample_heading_predictions(self, predictions: list[tuple[float, float, float]]) -> None:
+        with self._lock:
+            self._sample_heading_predictions = list(predictions)
 
     def _heuristic_command(
         self,
@@ -451,6 +462,7 @@ class ObstacleAwareMPPIController(threading.Thread):
 
         rollout_costs: list[float] = []
         rollout_noises: list[list[tuple[float, float]]] = []
+        sample_heading_predictions: list[tuple[float, float, float]] = []
 
         for _ in range(self._num_samples):
             candidate_controls: list[tuple[float, float]] = []
@@ -466,6 +478,14 @@ class ObstacleAwareMPPIController(threading.Thread):
                         clamp(right_nominal + noise_right),
                     )
                 )
+
+            preview_x, preview_y, preview_heading = self._simulate_step(
+                x,
+                y,
+                heading,
+                *candidate_controls[0],
+            )
+            sample_heading_predictions.append((preview_x, preview_y, preview_heading))
 
             cost = self._sequence_cost(
                 candidate_controls,
@@ -483,6 +503,7 @@ class ObstacleAwareMPPIController(threading.Thread):
         min_cost = min(rollout_costs)
         weights = [math.exp(-(cost - min_cost) / self._temperature) for cost in rollout_costs]
         weight_sum = sum(weights)
+        self._set_sample_heading_predictions(sample_heading_predictions)
         if weight_sum <= 1e-12:
             self._nominal_controls = nominal_sequence
             return nominal_sequence[0]
@@ -527,6 +548,7 @@ class ObstacleAwareMPPIController(threading.Thread):
                     mode="waiting_for_pose",
                     message="Waiting for a fresh pose for the selected object.",
                 )
+                self._set_sample_heading_predictions([])
                 self._stop_event.wait(self._period)
                 continue
 
@@ -557,6 +579,7 @@ class ObstacleAwareMPPIController(threading.Thread):
                     message=f"Reached target within epsilon ({tuning.epsilon:.1f}).",
                 )
                 self._nominal_controls = [(0.0, 0.0)] * self._horizon_steps
+                self._set_sample_heading_predictions([])
                 self._stop_event.wait(self._period)
                 continue
 
@@ -683,6 +706,16 @@ def make_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = make_parser()
     args = parser.parse_args()
+    startup_values = show_mppi_startup_config(
+        title="MPPI Obstacle Setup",
+        initial_values=vars(args).copy(),
+        include_obstacles=True,
+    )
+    if startup_values is None:
+        return
+    for key, value in startup_values.items():
+        setattr(args, key, value)
+
     selected_object_name = args.object_name or None
     display_scale = 1.0 if args.units == "mm" else 0.001
     room_center = tuple(value * display_scale for value in args.room_center)
@@ -759,58 +792,35 @@ def main() -> None:
     controller.start()
 
     fig = plt.figure(figsize=(14, 10))
-    ax = fig.add_axes([0.26, 0.36, 0.56, 0.56], projection="3d")
-    status_ax = fig.add_axes([0.03, 0.39, 0.20, 0.51])
+    ax = fig.add_axes([0.26, 0.24, 0.60, 0.68], projection="3d")
+    status_ax = fig.add_axes([0.03, 0.24, 0.20, 0.66])
     status_ax.axis("off")
-    initial_tuning = controller.tuning_snapshot()
 
-    fig.text(0.08, 0.315, "Go-To Target", fontsize=11, fontweight="bold")
-    fig.text(0.08, 0.205, "Controller Tuning", fontsize=11, fontweight="bold")
+    fig.text(0.08, 0.185, "Go-To Target", fontsize=11, fontweight="bold")
     fig.text(0.50, 0.095, "Manual Drive (press and hold)", fontsize=11, fontweight="bold", ha="center")
-    fig.text(0.08, 0.292, f"Target X ({args.units})", fontsize=9)
-    fig.text(0.26, 0.292, f"Target Y ({args.units})", fontsize=9)
-    fig.text(0.08, 0.182, f"Epsilon ({args.units})", fontsize=9)
-    fig.text(0.24, 0.182, "Angle Correction (deg)", fontsize=9)
+    fig.text(0.08, 0.162, f"Target X ({args.units})", fontsize=9)
+    fig.text(0.26, 0.162, f"Target Y ({args.units})", fontsize=9)
 
-    x_box_ax = fig.add_axes([0.08, 0.235, 0.14, 0.055])
-    y_box_ax = fig.add_axes([0.26, 0.235, 0.14, 0.055])
-    go_button_ax = fig.add_axes([0.45, 0.235, 0.11, 0.055])
-    stop_button_ax = fig.add_axes([0.60, 0.235, 0.16, 0.055])
-    epsilon_box_ax = fig.add_axes([0.08, 0.125, 0.12, 0.055])
-    offset_box_ax = fig.add_axes([0.24, 0.125, 0.12, 0.055])
-    apply_button_ax = fig.add_axes([0.40, 0.125, 0.11, 0.055])
+    x_box_ax = fig.add_axes([0.08, 0.105, 0.14, 0.055])
+    y_box_ax = fig.add_axes([0.26, 0.105, 0.14, 0.055])
+    go_button_ax = fig.add_axes([0.45, 0.105, 0.11, 0.055])
+    stop_button_ax = fig.add_axes([0.60, 0.105, 0.16, 0.055])
 
     x_text = TextBox(x_box_ax, "", initial="0")
     y_text = TextBox(y_box_ax, "", initial="0")
-    epsilon_text = TextBox(epsilon_box_ax, "", initial=f"{initial_tuning.epsilon * display_scale:.1f}")
-    offset_text = TextBox(offset_box_ax, "", initial=f"{initial_tuning.heading_offset_deg:.1f}")
     go_button = Button(go_button_ax, "Go", color="#8fd19e", hovercolor="#d5f5e3")
     stop_button = Button(stop_button_ax, "Stop Go-To", color="#f5a3a3", hovercolor="#fadbd8")
-    apply_button = Button(apply_button_ax, "Apply", color="#aed6f1", hovercolor="#d6eaf8")
     go_button.label.set_fontsize(10)
     stop_button.label.set_fontsize(10)
-    apply_button.label.set_fontsize(10)
+    sample_heading_toggle_ax = fig.add_axes([0.78, 0.095, 0.16, 0.08])
+    sample_heading_toggle = CheckButtons(sample_heading_toggle_ax, ["Show Sample\nHeadings"], [False])
+    for label in sample_heading_toggle.labels:
+        label.set_fontsize(9)
+    show_sample_headings = False
 
     active_manual_command: tuple[float, float] | None = None
 
-    def apply_tuning_from_boxes() -> bool:
-        try:
-            epsilon_display = float(epsilon_text.text)
-            heading_offset_deg = float(offset_text.text)
-        except ValueError:
-            controller.set_message("Invalid tuning entry. Use numeric values for epsilon and angle correction.")
-            return False
-
-        ok, message = controller.update_tuning(
-            epsilon=epsilon_display * input_to_vicon_scale,
-            heading_offset_deg=heading_offset_deg,
-        )
-        controller.set_message(message)
-        return ok
-
     def on_go_clicked(_event) -> None:
-        if not apply_tuning_from_boxes():
-            return
         try:
             target_x = float(x_text.text) * input_to_vicon_scale
             target_y = float(y_text.text) * input_to_vicon_scale
@@ -822,9 +832,6 @@ def main() -> None:
 
     def on_stop_clicked(_event) -> None:
         controller.clear_target("Stopped by user.")
-
-    def on_apply_clicked(_event) -> None:
-        apply_tuning_from_boxes()
 
     manual_button_specs = [
         {
@@ -892,9 +899,13 @@ def main() -> None:
         drive_state.stop()
         controller.set_message("Manual control released.")
 
+    def on_sample_heading_toggle(_label: str) -> None:
+        nonlocal show_sample_headings
+        show_sample_headings = sample_heading_toggle.get_status()[0]
+
     go_button.on_clicked(on_go_clicked)
     stop_button.on_clicked(on_stop_clicked)
-    apply_button.on_clicked(on_apply_clicked)
+    sample_heading_toggle.on_clicked(on_sample_heading_toggle)
     fig.canvas.mpl_connect("button_press_event", on_mouse_press)
     fig.canvas.mpl_connect("button_release_event", on_mouse_release)
 
@@ -906,6 +917,7 @@ def main() -> None:
         teleop_status = teleop_client.snapshot()
         target_state = controller.snapshot()
         tuning_state = controller.tuning_snapshot()
+        sample_heading_predictions = controller.sample_heading_snapshot()
 
         ax.cla()
         ax.set_xlabel(f"X ({args.units})")
@@ -993,6 +1005,34 @@ def main() -> None:
                     linewidth=1.0,
                     alpha=0.5,
                 )
+        if show_sample_headings and sample_heading_predictions:
+            sample_heading_length = max(robot_axis_length * 0.55, 1.0)
+            sample_alpha = min(0.25, max(0.04, 12.0 / max(len(sample_heading_predictions), 1)))
+            for preview_x, preview_y, preview_heading in sample_heading_predictions:
+                start_x = preview_x * display_scale
+                start_y = preview_y * display_scale
+                end_x = start_x + sample_heading_length * math.cos(preview_heading)
+                end_y = start_y + sample_heading_length * math.sin(preview_heading)
+                ax.plot(
+                    [start_x, end_x],
+                    [start_y, end_y],
+                    [room_floor_z, room_floor_z],
+                    color="#16a085",
+                    linewidth=1.0,
+                    alpha=sample_alpha,
+                )
+                plotted_points.extend([(start_x, start_y, room_floor_z), (end_x, end_y, room_floor_z)])
+            legend_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color="#16a085",
+                    linestyle="-",
+                    linewidth=1.2,
+                    alpha=0.7,
+                    label="sample headings",
+                )
+            )
         if obstacles:
             legend_handles.append(
                 Line2D(
