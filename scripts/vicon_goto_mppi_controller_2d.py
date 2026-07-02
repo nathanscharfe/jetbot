@@ -150,6 +150,7 @@ def draw_pose_marker_2d(
         [point[1] for point in loop],
         color=color,
         linewidth=1.8,
+        zorder=2,
     )
 
     physical_forward = rotate_vector(rotation, (0.0, axis_length, 0.0))
@@ -180,9 +181,10 @@ def draw_pose_marker_2d(
         xy=heading_tip,
         xytext=center,
         arrowprops={"arrowstyle": "->", "color": "#111111", "linewidth": 2.4},
+        zorder=4,
     )
     ax.scatter([center[0]], [center[1]], color=[color], s=50, zorder=5)
-    ax.text(center[0], center[1], f" {label}", color=color)
+    ax.text(center[0], center[1], f" {label}", color=color, zorder=6)
 
     return world_corners + [heading_tip, center]
 
@@ -290,13 +292,17 @@ def main() -> None:
     y_box_ax = fig.add_axes([0.26, 0.105, 0.14, 0.055])
     go_button_ax = fig.add_axes([0.45, 0.105, 0.11, 0.055])
     stop_button_ax = fig.add_axes([0.60, 0.105, 0.16, 0.055])
-    sample_heading_toggle_ax = fig.add_axes([0.78, 0.095, 0.16, 0.08])
+    sample_heading_toggle_ax = fig.add_axes([0.78, 0.082, 0.18, 0.10])
 
     x_text = TextBox(x_box_ax, "", initial="0")
     y_text = TextBox(y_box_ax, "", initial="0")
     go_button = Button(go_button_ax, "Go", color="#8fd19e", hovercolor="#d5f5e3")
     stop_button = Button(stop_button_ax, "Stop Go-To", color="#f5a3a3", hovercolor="#fadbd8")
-    sample_heading_toggle = CheckButtons(sample_heading_toggle_ax, ["Show Sample\nHeadings"], [False])
+    sample_heading_toggle = CheckButtons(
+        sample_heading_toggle_ax,
+        ["Show Sample\nHeadings", "Show Sample\nRollouts"],
+        [False, False],
+    )
     for label in sample_heading_toggle.labels:
         label.set_fontsize(9)
     go_button.label.set_fontsize(10)
@@ -305,6 +311,7 @@ def main() -> None:
     color_cycle = list(plt.get_cmap("tab10").colors)
     active_manual_command: tuple[float, float] | None = None
     show_sample_headings = False
+    show_sample_rollouts = False
 
     def on_go_clicked(_event) -> None:
         try:
@@ -357,8 +364,8 @@ def main() -> None:
         controller.set_message("Manual control released.")
 
     def on_sample_heading_toggle(_label: str) -> None:
-        nonlocal show_sample_headings
-        show_sample_headings = sample_heading_toggle.get_status()[0]
+        nonlocal show_sample_headings, show_sample_rollouts
+        show_sample_headings, show_sample_rollouts = sample_heading_toggle.get_status()
 
     go_button.on_clicked(on_go_clicked)
     stop_button.on_clicked(on_stop_clicked)
@@ -374,6 +381,7 @@ def main() -> None:
         target_state = controller.snapshot()
         tuning_state = controller.tuning_snapshot()
         sample_heading_predictions = controller.sample_heading_snapshot()
+        sample_rollout_paths = controller.sample_rollout_snapshot()
 
         ax.cla()
         ax.set_xlabel(f"X ({args.units})")
@@ -446,6 +454,28 @@ def main() -> None:
                     alpha=0.5,
                 )
 
+        if show_sample_rollouts and sample_rollout_paths:
+            rollout_alpha = min(0.26, max(0.04, 8.0 / max(len(sample_rollout_paths), 1)))
+            for rollout_path in sample_rollout_paths:
+                if not rollout_path:
+                    continue
+                path_points = [
+                    (preview_x * display_scale, preview_y * display_scale)
+                    for preview_x, preview_y, _preview_heading in rollout_path
+                ]
+                ax.plot(
+                    [point[0] for point in path_points],
+                    [point[1] for point in path_points],
+                    color="#2ecc71",
+                    linewidth=0.9,
+                    alpha=rollout_alpha,
+                    zorder=7,
+                )
+                plotted_points.extend(path_points)
+            legend_handles.append(
+                Line2D([0], [0], color="#2ecc71", linestyle="-", linewidth=1.2, alpha=0.75, label="sample rollouts")
+            )
+
         if show_sample_headings and sample_heading_predictions:
             sample_heading_length = max(robot_axis_length * 0.55, 1.0)
             sample_alpha = min(0.25, max(0.04, 12.0 / max(len(sample_heading_predictions), 1)))
@@ -460,6 +490,7 @@ def main() -> None:
                     color="#16a085",
                     linewidth=1.0,
                     alpha=sample_alpha,
+                    zorder=8,
                 )
                 plotted_points.extend([(start_x, start_y), (end_x, end_y)])
             legend_handles.append(
@@ -501,6 +532,7 @@ def main() -> None:
                 f"Epsilon ({args.units}): {tuning_state.epsilon * display_scale:.3f}",
                 f"Angle correction (deg): {tuning_state.heading_offset_deg:.1f}",
                 f"MPPI: samples={args.num_samples}, horizon={args.horizon_steps}, temp={args.temperature:.2f}",
+                f"Rollout preview paths: {len(sample_rollout_paths)}",
                 f"Model: v={args.model_linear_speed:.1f} {args.units}/s, w={args.model_angular_speed:.2f} rad/s",
             ]
         )

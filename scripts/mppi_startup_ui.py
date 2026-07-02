@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk
 
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, TextBox
@@ -144,12 +148,7 @@ def _debug_fields() -> list[StartupField]:
     return [StartupField("verbose", "Verbose", "bool")]
 
 
-def show_mppi_startup_config(
-    *,
-    title: str,
-    initial_values: dict[str, object],
-    include_obstacles: bool,
-) -> dict[str, object] | None:
+def _build_columns(include_obstacles: bool) -> list[list[tuple[str, list[StartupField]]]]:
     columns: list[list[tuple[str, list[StartupField]]]] = [
         [("Connection", _common_connection_fields())],
         [("Display", _common_display_fields())],
@@ -166,6 +165,25 @@ def show_mppi_startup_config(
         )
     else:
         columns[-1].append(("Debug", _debug_fields()))
+    return columns
+
+
+def _field_lookup(columns: list[list[tuple[str, list[StartupField]]]]) -> dict[str, StartupField]:
+    return {
+        field.key: field
+        for section_group in columns
+        for _, fields in section_group
+        for field in fields
+    }
+
+
+def show_mppi_startup_config(
+    *,
+    title: str,
+    initial_values: dict[str, object],
+    include_obstacles: bool,
+) -> dict[str, object] | None:
+    columns = _build_columns(include_obstacles)
 
     fig = plt.figure(figsize=(19, 10))
     fig.text(0.03, 0.965, title, fontsize=16, fontweight="bold")
@@ -221,12 +239,7 @@ def show_mppi_startup_config(
     next_button.label.set_fontsize(11)
     cancel_button.label.set_fontsize(11)
 
-    field_lookup = {
-        field.key: field
-        for section_group in columns
-        for _, fields in section_group
-        for field in fields
-    }
+    field_lookup = _field_lookup(columns)
 
     def on_next_clicked(_event) -> None:
         values: dict[str, object] = {}
@@ -250,6 +263,135 @@ def show_mppi_startup_config(
     next_button.on_clicked(on_next_clicked)
     cancel_button.on_clicked(on_cancel_clicked)
     plt.show()
+
+    if not result["accepted"]:
+        return None
+    return result["values"]
+
+
+def show_mppi_startup_config_tk(
+    *,
+    title: str,
+    initial_values: dict[str, object],
+    include_obstacles: bool,
+    config_path: str | None = None,
+) -> dict[str, object] | None:
+    columns = _build_columns(include_obstacles)
+    field_lookup = _field_lookup(columns)
+
+    result: dict[str, object] = {"accepted": False, "values": None}
+    root = tk.Tk()
+    root.title(title)
+    root.geometry("1900x980")
+    root.minsize(1500, 860)
+    root.configure(padx=14, pady=12)
+    try:
+        root.state("zoomed")
+    except tk.TclError:
+        pass
+
+    header_frame = ttk.Frame(root)
+    header_frame.pack(fill="x", pady=(0, 10))
+    ttk.Label(header_frame, text=title, font=("Segoe UI", 18, "bold")).pack(anchor="w")
+    ttk.Label(
+        header_frame,
+        text="Set startup parameters here, then click Next. Use true/false for booleans and X, Y, Z for room vectors.",
+        font=("Segoe UI", 11),
+    ).pack(anchor="w", pady=(4, 0))
+    ttk.Label(
+        header_frame,
+        text="Choices: drive backend = jetbot-socket or arduino-bluetooth. Display units = mm or m.",
+        foreground="#555555",
+    ).pack(anchor="w", pady=(2, 0))
+
+    content_frame = ttk.Frame(root)
+    content_frame.pack(fill="both", expand=True)
+    textvars: dict[str, tk.StringVar] = {}
+    first_entry: ttk.Entry | None = None
+
+    for column_index, section_group in enumerate(columns):
+        column_frame = ttk.Frame(content_frame)
+        column_frame.grid(row=0, column=column_index, sticky="nsew", padx=(0, 12) if column_index < len(columns) - 1 else 0)
+        content_frame.grid_columnconfigure(column_index, weight=1)
+
+        for section_name, fields in section_group:
+            section_frame = ttk.LabelFrame(column_frame, text=section_name, padding=(10, 8))
+            section_frame.pack(fill="x", pady=(0, 10))
+            section_frame.grid_columnconfigure(0, weight=1)
+
+            for field_index, field in enumerate(fields):
+                row_base = field_index * 2
+                ttk.Label(section_frame, text=field.label).grid(row=row_base, column=0, sticky="w")
+                variable = tk.StringVar(value=_format_value(field, initial_values[field.key]))
+                textvars[field.key] = variable
+                entry = ttk.Entry(section_frame, textvariable=variable, width=28)
+                entry.grid(row=row_base + 1, column=0, sticky="ew", pady=(0, 8))
+                if first_entry is None:
+                    first_entry = entry
+
+    footer_frame = ttk.Frame(root)
+    footer_frame.pack(fill="x", pady=(4, 0))
+    status_var = tk.StringVar(value="")
+    status_label = ttk.Label(footer_frame, textvariable=status_var, foreground="#b00020")
+    status_label.pack(side="left", fill="x", expand=True)
+    ttk.Button(footer_frame, text="Next", command=lambda: on_next_clicked()).pack(side="right", padx=(8, 0))
+    ttk.Button(footer_frame, text="Cancel", command=lambda: on_cancel_clicked()).pack(side="right")
+    if config_path:
+        ttk.Button(footer_frame, text="Save as Default", command=lambda: on_save_defaults_clicked()).pack(
+            side="right",
+            padx=(8, 0),
+        )
+
+    def parse_current_values() -> dict[str, object]:
+        values: dict[str, object] = {}
+        for key, variable in textvars.items():
+            values[key] = _parse_value(field_lookup[key], variable.get())
+        if values["drive_backend"] == "arduino-bluetooth" and not str(values["serial_port"]).strip():
+            raise ValueError("Serial Port is required for the arduino-bluetooth backend.")
+        return values
+
+    def on_next_clicked() -> None:
+        try:
+            values = parse_current_values()
+        except ValueError as exc:
+            status_var.set(f"Invalid startup configuration: {exc}")
+            status_label.configure(foreground="#b00020")
+            return
+
+        result["accepted"] = True
+        result["values"] = values
+        root.destroy()
+
+    def on_save_defaults_clicked() -> None:
+        try:
+            values = parse_current_values()
+        except ValueError as exc:
+            status_var.set(f"Invalid startup configuration: {exc}")
+            status_label.configure(foreground="#b00020")
+            return
+
+        try:
+            path = Path(config_path) if config_path else None
+            assert path is not None
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(values, indent=2), encoding="utf-8")
+        except OSError as exc:
+            status_var.set(f"Could not save defaults: {exc}")
+            status_label.configure(foreground="#b00020")
+            return
+
+        status_var.set(f"Saved defaults to {path}")
+        status_label.configure(foreground="#1f6f43")
+
+    def on_cancel_clicked() -> None:
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_cancel_clicked)
+    root.bind("<Return>", lambda _event: on_next_clicked())
+    root.bind("<Escape>", lambda _event: on_cancel_clicked())
+    if first_entry is not None:
+        root.after(10, first_entry.focus_set)
+    root.mainloop()
 
     if not result["accepted"]:
         return None

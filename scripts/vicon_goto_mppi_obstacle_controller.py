@@ -43,11 +43,36 @@ DEFAULT_JETBOT_HOST = "192.168.0.86"
 DEFAULT_JETBOT_PORT = 8765
 DEFAULT_SERIAL_BAUD = 9600
 DEFAULT_SERIAL_MAX_PWM = 255
+DEFAULT_ROLLOUT_PREVIEW_LIMIT = 24
 UNSET = object()
 
 
 def wrap_to_pi(angle_radians: float) -> float:
     return (angle_radians + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def select_representative_indices(costs: list[float], limit: int) -> list[int]:
+    if not costs or limit <= 0:
+        return []
+
+    ordered = sorted(range(len(costs)), key=lambda index: costs[index])
+    if len(ordered) <= limit:
+        return ordered
+
+    selected: list[int] = []
+    for sample_index in range(limit):
+        position = round(sample_index * (len(ordered) - 1) / max(limit - 1, 1))
+        index = ordered[position]
+        if index not in selected:
+            selected.append(index)
+
+    for index in ordered:
+        if len(selected) >= limit:
+            break
+        if index not in selected:
+            selected.append(index)
+
+    return selected
 
 
 @dataclass
@@ -173,9 +198,9 @@ class ObstacleAwareMPPIController(threading.Thread):
             epsilon=epsilon,
             heading_offset_deg=heading_offset_deg,
         )
-        self._speed = speed
-        self._turn_speed = turn_speed
-        self._min_forward_speed = min_forward_speed
+        self._speed = clamp(speed, 0.0, 1.0)
+        self._turn_speed = clamp(turn_speed, 0.0, 1.0)
+        self._min_forward_speed = clamp(min_forward_speed, 0.0, self._speed)
         self._slow_near_target = slow_near_target
         self._slow_radius = slow_radius
         self._heading_gain = heading_gain
@@ -201,6 +226,7 @@ class ObstacleAwareMPPIController(threading.Thread):
         self._obstacle_collision_cost = max(obstacle_collision_cost, 0.0)
         self._nominal_controls: list[tuple[float, float]] = [(0.0, 0.0)] * self._horizon_steps
         self._sample_heading_predictions: list[tuple[float, float, float]] = []
+        self._sample_rollout_paths: list[list[tuple[float, float, float]]] = []
         self._rng = random.Random()
 
     def set_target(self, target_x: float, target_y: float) -> None:
@@ -216,6 +242,8 @@ class ObstacleAwareMPPIController(threading.Thread):
                 message="Target accepted. Running MPPI rollouts toward goal.",
             )
             self._nominal_controls = [(0.0, 0.0)] * self._horizon_steps
+            self._sample_heading_predictions = []
+            self._sample_rollout_paths = []
 
     def clear_target(self, message: str = "Target cleared.") -> None:
         self._drive_state.stop()
@@ -225,6 +253,7 @@ class ObstacleAwareMPPIController(threading.Thread):
             self._state.message = message
             self._nominal_controls = [(0.0, 0.0)] * self._horizon_steps
             self._sample_heading_predictions = []
+            self._sample_rollout_paths = []
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -253,6 +282,10 @@ class ObstacleAwareMPPIController(threading.Thread):
     def sample_heading_snapshot(self) -> list[tuple[float, float, float]]:
         with self._lock:
             return list(self._sample_heading_predictions)
+
+    def sample_rollout_snapshot(self) -> list[list[tuple[float, float, float]]]:
+        with self._lock:
+            return [list(path) for path in self._sample_rollout_paths]
 
     def set_message(self, message: str) -> None:
         self._update_state(message=message)
@@ -305,6 +338,18 @@ class ObstacleAwareMPPIController(threading.Thread):
         with self._lock:
             self._sample_heading_predictions = list(predictions)
 
+    def _set_sample_rollout_paths(self, rollout_paths: list[list[tuple[float, float, float]]]) -> None:
+        with self._lock:
+            self._sample_rollout_paths = [list(path) for path in rollout_paths]
+
+    def _limit_drive_command(self, left: float, right: float) -> tuple[float, float]:
+        forward = clamp(0.5 * (left + right), -self._speed, self._speed)
+        turn = clamp(0.5 * (right - left), -self._turn_speed, self._turn_speed)
+        limited_left = forward - turn
+        limited_right = forward + turn
+        wheel_scale = max(1.0, abs(limited_left), abs(limited_right))
+        return limited_left / wheel_scale, limited_right / wheel_scale
+
     def _heuristic_command(
         self,
         x: float,
@@ -332,7 +377,7 @@ class ObstacleAwareMPPIController(threading.Thread):
             -self._turn_speed,
             self._turn_speed,
         )
-        return clamp(forward - steering), clamp(forward + steering)
+        return self._limit_drive_command(forward - steering, forward + steering)
 
     def _simulate_step(
         self,
@@ -352,6 +397,19 @@ class ObstacleAwareMPPIController(threading.Thread):
         y_next = y + linear_speed * math.sin(heading) * self._period
         heading_next = wrap_to_pi(heading + angular_speed * self._period)
         return x_next, y_next, heading_next
+
+    def _simulate_rollout_path(
+        self,
+        x: float,
+        y: float,
+        heading: float,
+        controls: list[tuple[float, float]],
+    ) -> list[tuple[float, float, float]]:
+        path: list[tuple[float, float, float]] = []
+        for left, right in controls:
+            x, y, heading = self._simulate_step(x, y, heading, left, right)
+            path.append((x, y, heading))
+        return path
 
     def _obstacle_cost(
         self,
@@ -377,6 +435,37 @@ class ObstacleAwareMPPIController(threading.Thread):
                 total_cost += self._obstacle_cost_weight * (normalized * normalized)
 
         return total_cost
+
+    def _closest_obstacle_clearance(
+        self,
+        x: float,
+        y: float,
+        obstacles: list[ObstacleObservation],
+    ) -> float | None:
+        if not obstacles:
+            return None
+
+        return min(
+            math.hypot(x - obstacle.x, y - obstacle.y) - self._obstacle_radius
+            for obstacle in obstacles
+        )
+
+    def _path_minimum_clearance(
+        self,
+        path: list[tuple[float, float, float]],
+        obstacles: list[ObstacleObservation],
+    ) -> float | None:
+        if not path or not obstacles:
+            return None
+
+        minimum_clearance: float | None = None
+        for x, y, _heading in path:
+            clearance = self._closest_obstacle_clearance(x, y, obstacles)
+            if clearance is None:
+                continue
+            if minimum_clearance is None or clearance < minimum_clearance:
+                minimum_clearance = clearance
+        return minimum_clearance
 
     def _sequence_cost(
         self,
@@ -458,11 +547,12 @@ class ObstacleAwareMPPIController(threading.Thread):
         for shifted, heuristic in zip(shifted_sequence, heuristic_sequence):
             left = (1.0 - self._heuristic_blend) * shifted[0] + self._heuristic_blend * heuristic[0]
             right = (1.0 - self._heuristic_blend) * shifted[1] + self._heuristic_blend * heuristic[1]
-            nominal_sequence.append((clamp(left), clamp(right)))
+            nominal_sequence.append(self._limit_drive_command(left, right))
 
         rollout_costs: list[float] = []
         rollout_noises: list[list[tuple[float, float]]] = []
         sample_heading_predictions: list[tuple[float, float, float]] = []
+        rollout_paths: list[list[tuple[float, float, float]]] = []
 
         for _ in range(self._num_samples):
             candidate_controls: list[tuple[float, float]] = []
@@ -472,20 +562,12 @@ class ObstacleAwareMPPIController(threading.Thread):
                 noise_left = self._rng.gauss(0.0, self._noise_std)
                 noise_right = self._rng.gauss(0.0, self._noise_std)
                 candidate_noise.append((noise_left, noise_right))
-                candidate_controls.append(
-                    (
-                        clamp(left_nominal + noise_left),
-                        clamp(right_nominal + noise_right),
-                    )
-                )
+                candidate_controls.append(self._limit_drive_command(left_nominal + noise_left, right_nominal + noise_right))
 
-            preview_x, preview_y, preview_heading = self._simulate_step(
-                x,
-                y,
-                heading,
-                *candidate_controls[0],
-            )
-            sample_heading_predictions.append((preview_x, preview_y, preview_heading))
+            candidate_path = self._simulate_rollout_path(x, y, heading, candidate_controls)
+            rollout_paths.append(candidate_path)
+            if candidate_path:
+                sample_heading_predictions.append(candidate_path[0])
 
             cost = self._sequence_cost(
                 candidate_controls,
@@ -497,6 +579,10 @@ class ObstacleAwareMPPIController(threading.Thread):
                 current_command,
                 obstacles,
             )
+            path_minimum_clearance = self._path_minimum_clearance(candidate_path, obstacles)
+            if path_minimum_clearance is not None and path_minimum_clearance <= 0.0:
+                penetration = -path_minimum_clearance / max(self._obstacle_radius, 1e-6)
+                cost += self._obstacle_collision_cost * (10.0 + penetration * penetration)
             rollout_costs.append(cost)
             rollout_noises.append(candidate_noise)
 
@@ -504,6 +590,8 @@ class ObstacleAwareMPPIController(threading.Thread):
         weights = [math.exp(-(cost - min_cost) / self._temperature) for cost in rollout_costs]
         weight_sum = sum(weights)
         self._set_sample_heading_predictions(sample_heading_predictions)
+        representative_indices = select_representative_indices(rollout_costs, DEFAULT_ROLLOUT_PREVIEW_LIMIT)
+        self._set_sample_rollout_paths([rollout_paths[index] for index in representative_indices])
         if weight_sum <= 1e-12:
             self._nominal_controls = nominal_sequence
             return nominal_sequence[0]
@@ -519,12 +607,7 @@ class ObstacleAwareMPPIController(threading.Thread):
 
             delta_left /= weight_sum
             delta_right /= weight_sum
-            updated_sequence.append(
-                (
-                    clamp(left_nominal + delta_left),
-                    clamp(right_nominal + delta_right),
-                )
-            )
+            updated_sequence.append(self._limit_drive_command(left_nominal + delta_left, right_nominal + delta_right))
 
         self._nominal_controls = updated_sequence
         return updated_sequence[0]
@@ -549,6 +632,7 @@ class ObstacleAwareMPPIController(threading.Thread):
                     message="Waiting for a fresh pose for the selected object.",
                 )
                 self._set_sample_heading_predictions([])
+                self._set_sample_rollout_paths([])
                 self._stop_event.wait(self._period)
                 continue
 
@@ -580,6 +664,7 @@ class ObstacleAwareMPPIController(threading.Thread):
                 )
                 self._nominal_controls = [(0.0, 0.0)] * self._horizon_steps
                 self._set_sample_heading_predictions([])
+                self._set_sample_rollout_paths([])
                 self._stop_event.wait(self._period)
                 continue
 
